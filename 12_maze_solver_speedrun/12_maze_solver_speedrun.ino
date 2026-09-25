@@ -68,7 +68,7 @@
 // few cells the robot thinks it is further along than it is and turns before its body is in
 // the cell. When a side wall ends, the side sensor is exactly at the cell boundary, so the
 // distance to the next cell centre is known and the remaining distance is reset from there.
-#define SIDE_SENSOR_AHEAD_MM   30  // MEASURE: how far the side ToF sensors sit in front of the wheel axle
+#define SIDE_SENSOR_AHEAD_MM   35  // MEASURE: how far the side ToF sensors sit in front of the wheel axle
 #define EDGE_TO_CENTER_TICKS   ((90L + SIDE_SENSOR_AHEAD_MM) * TICKS_PER_CELL / 180) // Boundary->next centre is 90 mm, plus the sensor-to-axle offset
 #define EDGE_CONFIRM_TICKS     12  // Wall must stay gone this far (~7 mm) so one bad reading isn't an edge
 #define EDGE_MAX_SHIFT_TICKS   (TICKS_PER_CELL / 3) // Ignore "edges" that disagree with the encoders by more
@@ -150,23 +150,21 @@ long readTravelTicks() {
 }
 
 // Tracks one side sensor while driving and reports the tick count where its wall ended.
-struct EdgeTracker {
-  bool hadWall;
-  long openSince; // Tick count where the wall first looked gone, -1 = wall present
-};
-
-// Returns the tick position of a confirmed wall end, or -1
-long trackEdge(EdgeTracker &t, int raw, long traveled) {
+// (Plain reference parameters instead of a struct: the Arduino IDE auto-generates function
+// prototypes above any struct definitions, which breaks functions that take a struct.)
+// hadWall: a wall was seen since the last edge. openSince: tick count where the wall first
+// looked gone, -1 = wall present. Returns the tick position of a confirmed wall end, or -1.
+long trackEdge(bool &hadWall, long &openSince, int raw, long traveled) {
   if (raw < WALL_THRESHOLD_MM) {
-    t.hadWall = true;
-    t.openSince = -1;
+    hadWall = true;
+    openSince = -1;
     return -1;
   }
-  if (!t.hadWall) return -1;
-  if (t.openSince < 0) t.openSince = traveled;
-  if (traveled - t.openSince < EDGE_CONFIRM_TICKS) return -1;
-  t.hadWall = false; // Need to see a wall again before the next edge
-  return t.openSince;
+  if (!hadWall) return -1;
+  if (openSince < 0) openSince = traveled;
+  if (traveled - openSince < EDGE_CONFIRM_TICKS) return -1;
+  hadWall = false; // Need to see a wall again before the next edge
+  return openSince;
 }
 
 // Move the stop point so it is EDGE_TO_CENTER_TICKS past the edge (plus whole cells if the
@@ -431,8 +429,8 @@ void moveForwardCells(int cells, bool speedRun) {
 
   avgLeft = 999;  // Seeded by the first valid reading
   avgRight = 999;
-  EdgeTracker leftEdge = { false, -1 };
-  EdgeTracker rightEdge = { false, -1 };
+  bool leftHadWall = false, rightHadWall = false;
+  long leftOpenSince = -1, rightOpenSince = -1;
   bool edgeCorrected = false;
 
   while (true) {
@@ -476,8 +474,8 @@ void moveForwardCells(int cells, bool speedRun) {
     avgLeft = smoothSide(avgLeft, rawLeft);
     avgRight = smoothSide(avgRight, rawRight);
 
-    long edgeAt = trackEdge(leftEdge, rawLeft, traveled);
-    long rightEdgeAt = trackEdge(rightEdge, rawRight, traveled);
+    long edgeAt = trackEdge(leftHadWall, leftOpenSince, rawLeft, traveled);
+    long rightEdgeAt = trackEdge(rightHadWall, rightOpenSince, rawRight, traveled);
     if (rightEdgeAt > edgeAt) edgeAt = rightEdgeAt;
     if (edgeAt >= 0) {
       long corrected = correctTargetFromEdge(targetTicks, edgeAt);
