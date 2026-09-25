@@ -48,6 +48,8 @@
 #define TARGET_WALL_STOP_MM 22
 // Distance threshold to consider a wall "present"
 #define WALL_THRESHOLD_MM   130
+#define TOF_TIMING_BUDGET_US 20000  // 20 ms per reading (library default is 33 ms)
+#define TOF_STALE_MS         150    // A reading older than this counts as "no reading"
 
 // Distance Tuning (Fallback if no front wall)
 #define TICKS_PER_CELL    290
@@ -55,11 +57,16 @@
 #define BASE_SPEED_RIGHT  160
 #define SPEED_RUN_BASE_SPEED 220 // 🚀 MAX SPEED FOR SPEED RUN
 #define SPEED_RAMP_TICKS  120    // Accelerate/decelerate over this many ticks in the speed run
+#define FAST_BRAKE_EXTRA_MM 25   // Extra front-stop distance at SPEED_RUN_BASE_SPEED (scaled by speed)
 
 // Turn Tuning
 #define TURN_SPEED        75
-#define TARGET_ANGLE      85.0f
+#define TARGET_ANGLE      85.0f  // Motors cut at this angle; the robot coasts the rest of the way
 #define TURN_FORWARD_OFFSET_TICKS 65 // ~4cm extra forward before turning to clear back wheels
+
+// Safety timeouts (stuck wheel, dead gyro, dead sensor)
+#define TURN_TIMEOUT_MS       3000
+#define MOVE_TIMEOUT_MS_CELL  2500
 
 // Gyro & ToF PID Tuning
 #define KP                6.0f
@@ -76,16 +83,26 @@
 volatile long encoderLeftTicks = 0;
 volatile long encoderRightTicks = 0;
 float gyroZOffset = 0;
-float currentHeading = 0;
 bool hasRun = false;
 
-// --- TOF AVERAGING GLOBALS ---
+// Heading is integrated continuously (including while stopped/coasting) and never reset between
+// moves, so any turn over/undershoot is corrected by the next straight instead of being kept.
+// Sign convention (same as the original controller): + = rotated left (CCW).
+float heading = 0;
+float targetHeading = 0;   // Always a multiple of 90 relative to the start alignment
+unsigned long lastGyroMicros = 0;
+
+// --- TOF GLOBALS ---
 float avgLeft = 999;
 float avgRight = 999;
 
 VL53L0X sensorLeft;
 VL53L0X sensorFront;
 VL53L0X sensorRight;
+
+// Latest bias-corrected readings, updated by pollToF() without blocking
+int tofFront = 999, tofLeft = 999, tofRight = 999;
+unsigned long tofFrontMs = 0, tofLeftMs = 0, tofRightMs = 0;
 
 // --- PATH MEMORY ---
 char path[MAX_PATH];
@@ -111,6 +128,16 @@ long readLeftTicks() {
   interrupts();
   return ticks;
 }
+long readRightTicks() {
+  noInterrupts();
+  long ticks = encoderRightTicks;
+  interrupts();
+  return ticks;
+}
+// Distance along the path = average of both wheels (steering corrections cancel out)
+long readTravelTicks() {
+  return (labs(readLeftTicks()) + labs(readRightTicks())) / 2;
+}
 void resetEncoders() {
   noInterrupts();
   encoderLeftTicks = 0;
@@ -119,22 +146,29 @@ void resetEncoders() {
 }
 
 // --- TOF HELPER FUNCTIONS ---
+// readRangeContinuousMillimeters() blocks until the next measurement (~33 ms each, up to the
+// 500 ms timeout if a sensor is unplugged), which made the "10 ms" control loops run at
+// ~30 Hz or slower. Instead, only read a sensor when it reports a new result.
+void pollOneToF(VL53L0X &s, int bias, int &value, unsigned long &stampMs) {
+  if ((s.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) == 0) return; // No new result yet
+  int raw = s.readRangeContinuousMillimeters(); // Result is ready, so this returns immediately
+  value = (s.timeoutOccurred() || raw >= 8000 || raw == 0) ? 999 : raw - bias;
+  stampMs = millis();
+}
+
+void pollToF() {
+  pollOneToF(sensorFront, FRONT_BIAS_MM, tofFront, tofFrontMs);
+  pollOneToF(sensorLeft, LEFT_BIAS_MM, tofLeft, tofLeftMs);
+  pollOneToF(sensorRight, RIGHT_BIAS_MM, tofRight, tofRightMs);
+}
+
 // All return 999 when no valid reading. Values can be <= 0 when very close to a wall.
-int getTrueFront() {
-  int raw = sensorFront.readRangeContinuousMillimeters();
-  if (sensorFront.timeoutOccurred() || raw >= 8000 || raw == 0) return 999;
-  return raw - FRONT_BIAS_MM;
+int freshOr999(int value, unsigned long stampMs) {
+  return (millis() - stampMs > TOF_STALE_MS) ? 999 : value;
 }
-int getTrueLeft() {
-  int raw = sensorLeft.readRangeContinuousMillimeters();
-  if (sensorLeft.timeoutOccurred() || raw >= 8000 || raw == 0) return 999;
-  return raw - LEFT_BIAS_MM;
-}
-int getTrueRight() {
-  int raw = sensorRight.readRangeContinuousMillimeters();
-  if (sensorRight.timeoutOccurred() || raw >= 8000 || raw == 0) return 999;
-  return raw - RIGHT_BIAS_MM;
-}
+int getTrueFront() { pollToF(); return freshOr999(tofFront, tofFrontMs); }
+int getTrueLeft()  { pollToF(); return freshOr999(tofLeft, tofLeftMs); }
+int getTrueRight() { pollToF(); return freshOr999(tofRight, tofRightMs); }
 
 // Exponential moving average that restarts cleanly when a wall reappears
 float smoothSide(float avg, int raw) {
@@ -144,31 +178,41 @@ float smoothSide(float avg, int raw) {
 }
 
 // --- HARDWARE INIT FUNCTIONS ---
-void initToFSensors() {
+bool initOneToF(VL53L0X &s, uint8_t xshutPin, uint8_t newAddress, const char *name) {
+  digitalWrite(xshutPin, HIGH); delay(50);
+  s.setTimeout(500);
+  if (!s.init()) {
+    Serial.print("ERROR: "); Serial.print(name); Serial.println(" ToF not found!");
+    // Hold it in reset: left at the default address it would clash with the next sensor
+    digitalWrite(xshutPin, LOW);
+    return false;
+  }
+  s.setAddress(newAddress);
+  s.setMeasurementTimingBudget(TOF_TIMING_BUDGET_US);
+  s.startContinuous();
+  return true;
+}
+
+bool initToFSensors() {
   pinMode(TOF_XSHUT_LEFT, OUTPUT); digitalWrite(TOF_XSHUT_LEFT, LOW);
   pinMode(TOF_XSHUT_FRONT, OUTPUT); digitalWrite(TOF_XSHUT_FRONT, LOW);
   pinMode(TOF_XSHUT_RIGHT, OUTPUT); digitalWrite(TOF_XSHUT_RIGHT, LOW);
   delay(100);
 
-  digitalWrite(TOF_XSHUT_LEFT, HIGH); delay(50);
-  sensorLeft.setTimeout(500);
-  if(sensorLeft.init()) { sensorLeft.setAddress(0x30); sensorLeft.startContinuous(); }
-  else Serial.println("ERROR: Left ToF not found!");
-
-  digitalWrite(TOF_XSHUT_FRONT, HIGH); delay(50);
-  sensorFront.setTimeout(500);
-  if(sensorFront.init()) { sensorFront.setAddress(0x31); sensorFront.startContinuous(); }
-  else Serial.println("ERROR: Front ToF not found!");
-
-  digitalWrite(TOF_XSHUT_RIGHT, HIGH); delay(50);
-  sensorRight.setTimeout(500);
-  if(sensorRight.init()) { sensorRight.setAddress(0x32); sensorRight.startContinuous(); }
-  else Serial.println("ERROR: Right ToF not found!");
+  bool ok = initOneToF(sensorLeft, TOF_XSHUT_LEFT, 0x30, "Left");
+  ok &= initOneToF(sensorFront, TOF_XSHUT_FRONT, 0x31, "Front");
+  ok &= initOneToF(sensorRight, TOF_XSHUT_RIGHT, 0x32, "Right");
+  return ok;
 }
 
-void initMPU6050() {
-  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission(true);
+bool initMPU6050() {
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00);
+  if (Wire.endTransmission(true) != 0) {
+    Serial.println("ERROR: MPU6050 not found!");
+    return false;
+  }
   Wire.beginTransmission(MPU_ADDR); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission(true);
+  return true;
 }
 
 int16_t readGyroZRaw() {
@@ -186,10 +230,22 @@ void calibrateGyro() {
   long sum = 0;
   for (int i = 0; i < GYRO_CALIB_SAMPLES; i++) { sum += readGyroZRaw(); delay(3); }
   gyroZOffset = (float)sum / GYRO_CALIB_SAMPLES;
+  heading = 0;
+  targetHeading = 0;
+  lastGyroMicros = micros();
 }
 
 float getGyroZRate() {
   return (readGyroZRaw() - gyroZOffset) / 131.0f;
+}
+
+// Integrate the gyro into `heading`. Call as often as possible, including while stopped.
+void updateGyro() {
+  unsigned long now = micros();
+  float dt = (now - lastGyroMicros) * 1e-6f;
+  lastGyroMicros = now;
+  if (dt > 0.05f) dt = 0.05f; // After an idle wait (e.g. waiting for the button) don't integrate a huge step
+  heading += getGyroZRate() * dt;
 }
 
 // --- MOTOR CONTROL FUNCTIONS ---
@@ -212,6 +268,17 @@ void setMotors(int leftSpeed, int rightSpeed) {
 }
 
 void stopMotors() { setMotors(0, 0); }
+
+// Stop and wait for the chassis to settle, still tracking the gyro (so coasting after a turn
+// is measured) and the ToF sensors (so wall readings afterwards were taken while stationary).
+void settle(unsigned int ms) {
+  stopMotors();
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    updateGyro();
+    pollToF();
+  }
+}
 
 // --- PATH LOGIC ---
 // Each path entry means "turn (R/L/U/S) in this cell, then drive one cell".
@@ -274,40 +341,36 @@ void startAlignment() {
 
   Serial.println("Moving 2.2cm to cell center...");
   resetEncoders();
-  currentHeading = 0;
-  unsigned long lastTime = millis();
-  while(labs(readLeftTicks()) < 35) { // ~2.2cm
-     unsigned long currentMillis = millis();
-     if (currentMillis - lastTime >= 10) {
-       float dt = (currentMillis - lastTime) / 1000.0f;
-       lastTime = currentMillis;
-       currentHeading += getGyroZRate() * dt;
-       float correction = KP * (0.0f - currentHeading);
-       setMotors(70 - correction, 70 + correction); // Move slow
-     }
+  unsigned long start = millis();
+  unsigned long lastTime = start;
+  while (labs(readLeftTicks()) < 35 && millis() - start < 1500) { // ~2.2cm
+    updateGyro();
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastTime >= 10) {
+      lastTime = currentMillis;
+      float correction = KP * (targetHeading - heading);
+      setMotors(70 - correction, 70 + correction); // Move slow
+    }
   }
-  stopMotors();
-  delay(300);
+  settle(300);
 }
 
 void moveForwardExtra(int targetTicks) {
   resetEncoders();
-  currentHeading = 0;
-  unsigned long lastLoopTime = millis();
-  while (labs(readLeftTicks()) < targetTicks) {
+  unsigned long start = millis();
+  unsigned long lastLoopTime = start;
+  while (labs(readLeftTicks()) < targetTicks && millis() - start < 1000) {
+    updateGyro();
     unsigned long currentMillis = millis();
     if (currentMillis - lastLoopTime >= 10) {
-      float dt = (currentMillis - lastLoopTime) / 1000.0f;
       lastLoopTime = currentMillis;
-      currentHeading += getGyroZRate() * dt;
-      float correction = KP * (0.0f - currentHeading);
+      float correction = KP * (targetHeading - heading);
       setMotors(BASE_SPEED_LEFT - correction, BASE_SPEED_RIGHT + correction);
     }
     // Safety check: Don't crash into front wall!
     if (getTrueFront() <= TARGET_WALL_STOP_MM) break;
   }
-  stopMotors();
-  delay(100);
+  settle(100);
 }
 
 // Drive straight for `cells` cells. In the speed run it ramps up and down between
@@ -317,36 +380,52 @@ void moveForwardCells(int cells, bool speedRun) {
   Serial.print("Moving: FORWARD "); Serial.print(cells); Serial.println(" CELL(S)");
   long targetTicks = (long)cells * TICKS_PER_CELL;
   int rightTrim = BASE_SPEED_RIGHT - BASE_SPEED_LEFT;
-  int stopThreshold = speedRun ? TARGET_WALL_STOP_MM + 25 : TARGET_WALL_STOP_MM; // Hit brakes earlier if going fast!
+  unsigned long timeoutMs = (unsigned long)cells * MOVE_TIMEOUT_MS_CELL;
 
   resetEncoders();
-  currentHeading = 0;
   float previousError = 0, integralError = 0;
   bool firstLoop = true;
-  unsigned long lastLoopTime = millis();
+  unsigned long start = millis();
+  unsigned long lastLoopTime = start;
 
   avgLeft = 999;  // Seeded by the first valid reading
   avgRight = 999;
 
   while (true) {
-    long traveled = labs(readLeftTicks());
+    long traveled = readTravelTicks();
     if (traveled >= targetTicks) break;
+    if (millis() - start > timeoutMs) {
+      Serial.println("WARNING: Move timed out (stuck?)");
+      break;
+    }
+
+    updateGyro();
 
     unsigned long currentMillis = millis();
     if (currentMillis - lastLoopTime < 10) continue;
     float dt = (currentMillis - lastLoopTime) / 1000.0f;
     lastLoopTime = currentMillis;
 
+    int base = BASE_SPEED_LEFT;
+    if (speedRun) {
+      long distToEnd = min(traveled, targetTicks - traveled);
+      base = map(constrain(distToEnd, 0, SPEED_RAMP_TICKS), 0, SPEED_RAMP_TICKS,
+                 BASE_SPEED_LEFT, SPEED_RUN_BASE_SPEED);
+    }
+
     // Front ToF Verification: Stop EXACTLY in the center if there is a wall!
     // (No "> 0" check: a reading <= 0 means we are already very close and must stop.)
-    int trueFront = getTrueFront();
-    if (trueFront <= stopThreshold) {
+    // Brake earlier only when actually going fast; at exploration speed stop at the normal point.
+    int stopThreshold = TARGET_WALL_STOP_MM;
+    if (base > BASE_SPEED_LEFT && SPEED_RUN_BASE_SPEED > BASE_SPEED_LEFT) {
+      stopThreshold += (long)FAST_BRAKE_EXTRA_MM * (base - BASE_SPEED_LEFT) / (SPEED_RUN_BASE_SPEED - BASE_SPEED_LEFT);
+    }
+    if (getTrueFront() <= stopThreshold) {
       Serial.println("FRONT WALL VERIFIED! Stopping perfectly in center.");
       break;
     }
 
-    currentHeading += getGyroZRate() * dt;
-    float gyroError = 0.0f - currentHeading;
+    float gyroError = targetHeading - heading;
 
     avgLeft = smoothSide(avgLeft, getTrueLeft());
     avgRight = smoothSide(avgRight, getTrueRight());
@@ -365,50 +444,39 @@ void moveForwardCells(int cells, bool speedRun) {
     previousError = totalError;
     firstLoop = false;
 
-    int base = BASE_SPEED_LEFT;
-    if (speedRun) {
-      long distToEnd = min(traveled, targetTicks - traveled);
-      base = map(constrain(distToEnd, 0, SPEED_RAMP_TICKS), 0, SPEED_RAMP_TICKS,
-                 BASE_SPEED_LEFT, SPEED_RUN_BASE_SPEED);
-    }
-
     float correction = (KP * totalError) + (KI * integralError) + (KD * derivativeError);
     setMotors(base - correction, base + rightTrim + correction);
   }
-  stopMotors();
-  delay(300); // Wait for chassis to settle
+  settle(300); // Wait for chassis to settle
+}
+
+// Rotate in place by `degrees` (+ = left). The target is kept as an exact multiple of 90, so
+// the error left over from the previous turn is made up here and in the next straight.
+void turnInPlace(float degrees) {
+  targetHeading += degrees;
+  float stopMargin = 90.0f - TARGET_ANGLE; // Cut the motors early and let the robot coast in
+  int dir = (degrees > 0) ? 1 : -1;        // +1 = left
+  setMotors(-dir * TURN_SPEED, dir * TURN_SPEED);
+
+  unsigned long start = millis();
+  while ((targetHeading - heading) * dir > stopMargin) {
+    updateGyro();
+    if (millis() - start > TURN_TIMEOUT_MS) {
+      Serial.println("WARNING: Turn timed out (gyro/motor problem?)");
+      break;
+    }
+  }
+  settle(400);
 }
 
 void turnRight90() {
   Serial.println("Moving: TURN RIGHT 90");
-  currentHeading = 0;
-  unsigned long lastLoopTime = millis();
-  setMotors(TURN_SPEED, -TURN_SPEED);
-  while (abs(currentHeading) < TARGET_ANGLE) {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastLoopTime >= 5) {
-      float dt = (currentMillis - lastLoopTime) / 1000.0f;
-      lastLoopTime = currentMillis;
-      currentHeading += getGyroZRate() * dt;
-    }
-  }
-  stopMotors(); delay(400);
+  turnInPlace(-90.0f);
 }
 
 void turnLeft90() {
   Serial.println("Moving: TURN LEFT 90");
-  currentHeading = 0;
-  unsigned long lastLoopTime = millis();
-  setMotors(-TURN_SPEED, TURN_SPEED);
-  while (abs(currentHeading) < TARGET_ANGLE) {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastLoopTime >= 5) {
-      float dt = (currentMillis - lastLoopTime) / 1000.0f;
-      lastLoopTime = currentMillis;
-      currentHeading += getGyroZRate() * dt;
-    }
-  }
-  stopMotors(); delay(400);
+  turnInPlace(90.0f);
 }
 
 void performTurn(char move) {
@@ -499,19 +567,35 @@ bool exploreMaze() {
   return true;
 }
 
-void failAndHalt() {
+void failAndHalt(const char *reason) {
   stopMotors();
-  Serial.println("Stopping. Check GOAL_X / GOAL_Y / MAX_EXPLORE_CELLS.");
+  digitalWrite(MOTOR_STBY, LOW);
+  Serial.print("Stopping: "); Serial.println(reason);
   while (true) { // Fast blink forever = error
     digitalWrite(STATUS_LED, HIGH); delay(80);
     digitalWrite(STATUS_LED, LOW); delay(80);
   }
 }
 
+// Wait for a full press + release of the start button (debounced)
+void waitForButton() {
+  while (true) {
+    while (digitalRead(START_BUTTON) == HIGH); // wait for press
+    delay(50);
+    if (digitalRead(START_BUTTON) == LOW) break; // still pressed = real press, not a glitch
+  }
+  while (digitalRead(START_BUTTON) == LOW); // wait for release
+  delay(50);
+}
+
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  Wire.setClock(400000); // Both the MPU6050 and VL53L0X support 400 kHz: faster control loops
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(3000, true); // Recover instead of hanging forever if motor noise upsets the bus
+#endif
 
   pinMode(STATUS_LED, OUTPUT);
   pinMode(START_BUTTON, INPUT_PULLUP);
@@ -523,8 +607,9 @@ void setup() {
 
   setupMotors();
   Serial.println("\nInitializing Sensors...");
-  initToFSensors();
-  initMPU6050();
+  bool tofOk = initToFSensors();
+  bool imuOk = initMPU6050();
+  if (!tofOk || !imuOk) failAndHalt("sensor missing - check wiring");
 
   Serial.println("\n=== MAZE SOLVER & SPEED RUNNER ===");
   Serial.println("Press START button (A3) to begin...");
@@ -532,72 +617,69 @@ void setup() {
 
 // --- MAIN LOOP ---
 void loop() {
-  if (!hasRun) {
-    if (digitalRead(START_BUTTON) == LOW) {
-      delay(50);
-      while(digitalRead(START_BUTTON) == LOW);
+  if (hasRun) return;
 
-      for (int i = 0; i < 3; i++) {
-        digitalWrite(STATUS_LED, HIGH); delay(200);
-        digitalWrite(STATUS_LED, LOW); delay(200);
-      }
+  waitForButton();
 
-      Serial.println("\n--- MAZE SOLVING STARTED ---");
-
-      // Phase 0: Square Up against the wall!
-      startAlignment();
-
-      // Phase 1: EXPLORATION (until goal or MAX_EXPLORE_CELLS)
-      bool explored = exploreMaze();
-
-      Serial.println("Exploration finished. Path Optimized:");
-      for(int i=0; i<pathLength; i++) { Serial.print(path[i]); Serial.print(" "); }
-      Serial.println();
-
-      if (!explored) failAndHalt();
-
-      // Phase 2: RETURN HOME
-      Serial.println("Returning Home...");
-      turnRight90(); turnRight90(); // U-turn to face backwards
-      executePath(false, true); // Navigate the path backward!
-
-      // We are now back in the start cell, facing the back wall.
-      Serial.println("Arrived Home! Preparing for Speed Run...");
-      turnRight90(); turnRight90(); // U-turn to face forward again
-      startAlignment(); // Square up perfectly for the speed run
-
-      // Phase 3: SPEED RUN PREP (WAIT FOR USER)
-      Serial.println("\n--- WAITING FOR USER TO START SPEED RUN ---");
-
-      // 1. Blink LED for 10 seconds
-      unsigned long blinkStart = millis();
-      while(millis() - blinkStart < 10000) {
-        digitalWrite(STATUS_LED, HIGH); delay(250);
-        digitalWrite(STATUS_LED, LOW); delay(250);
-      }
-
-      // 2. Stay ON for 5 seconds
-      digitalWrite(STATUS_LED, HIGH);
-      delay(5000);
-      digitalWrite(STATUS_LED, LOW);
-
-      // 3. Wait for button click!
-      Serial.println("Press START button (A3) to launch SPEED RUN!");
-      while(digitalRead(START_BUTTON) == HIGH); // wait for press
-      delay(50);
-      while(digitalRead(START_BUTTON) == LOW); // wait for release
-
-      // Quick countdown flashes
-      for (int i=0; i<3; i++) {
-        digitalWrite(STATUS_LED, HIGH); delay(100);
-        digitalWrite(STATUS_LED, LOW); delay(100);
-      }
-
-      Serial.println("\n--- SPEED RUN ENGAGED ---");
-      executePath(true, false); // BLAST IT!
-
-      Serial.println("SPEED RUN COMPLETE!");
-      hasRun = true;
-    }
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(STATUS_LED, HIGH); delay(200);
+    digitalWrite(STATUS_LED, LOW); delay(200);
   }
+
+  Serial.println("\n--- MAZE SOLVING STARTED ---");
+
+  // Phase 0: Square Up against the wall!
+  startAlignment();
+
+  // Phase 1: EXPLORATION (until goal or MAX_EXPLORE_CELLS)
+  bool explored = exploreMaze();
+
+  Serial.println("Exploration finished. Path Optimized:");
+  for(int i=0; i<pathLength; i++) { Serial.print(path[i]); Serial.print(" "); }
+  Serial.println();
+
+  if (!explored) failAndHalt("exploration failed - check GOAL_X / GOAL_Y / MAX_EXPLORE_CELLS");
+
+  // Phase 2: RETURN HOME
+  Serial.println("Returning Home...");
+  turnRight90(); turnRight90(); // U-turn to face backwards
+  executePath(false, true); // Navigate the path backward!
+
+  // We are now back in the start cell, facing the back wall.
+  Serial.println("Arrived Home! Preparing for Speed Run...");
+  turnRight90(); turnRight90(); // U-turn to face forward again
+  startAlignment(); // Square up perfectly for the speed run
+
+  // Phase 3: SPEED RUN PREP (WAIT FOR USER)
+  Serial.println("\n--- WAITING FOR USER TO START SPEED RUN ---");
+
+  // 1. Blink LED for 10 seconds
+  unsigned long blinkStart = millis();
+  while(millis() - blinkStart < 10000) {
+    digitalWrite(STATUS_LED, HIGH); delay(250);
+    digitalWrite(STATUS_LED, LOW); delay(250);
+  }
+
+  // 2. Stay ON for 5 seconds
+  digitalWrite(STATUS_LED, HIGH);
+  delay(5000);
+  digitalWrite(STATUS_LED, LOW);
+
+  // 3. Wait for button click!
+  Serial.println("Press START button (A3) to launch SPEED RUN!");
+  waitForButton();
+
+  // Quick countdown flashes
+  for (int i=0; i<3; i++) {
+    digitalWrite(STATUS_LED, HIGH); delay(100);
+    digitalWrite(STATUS_LED, LOW); delay(100);
+  }
+
+  Serial.println("\n--- SPEED RUN ENGAGED ---");
+  executePath(true, false); // BLAST IT!
+
+  stopMotors();
+  digitalWrite(MOTOR_STBY, LOW);
+  Serial.println("SPEED RUN COMPLETE!");
+  hasRun = true;
 }
