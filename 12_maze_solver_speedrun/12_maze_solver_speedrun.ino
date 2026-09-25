@@ -64,6 +64,15 @@
 #define TARGET_ANGLE      85.0f  // Motors cut at this angle; the robot coasts the rest of the way
 #define TURN_FORWARD_OFFSET_TICKS 65 // ~4cm extra forward before turning to clear back wheels
 
+// Wall-edge (post) correction. Encoder distance alone drifts a few mm every cell, so after a
+// few cells the robot thinks it is further along than it is and turns before its body is in
+// the cell. When a side wall ends, the side sensor is exactly at the cell boundary, so the
+// distance to the next cell centre is known and the remaining distance is reset from there.
+#define SIDE_SENSOR_AHEAD_MM   30  // MEASURE: how far the side ToF sensors sit in front of the wheel axle
+#define EDGE_TO_CENTER_TICKS   ((90L + SIDE_SENSOR_AHEAD_MM) * TICKS_PER_CELL / 180) // Boundary->next centre is 90 mm, plus the sensor-to-axle offset
+#define EDGE_CONFIRM_TICKS     12  // Wall must stay gone this far (~7 mm) so one bad reading isn't an edge
+#define EDGE_MAX_SHIFT_TICKS   (TICKS_PER_CELL / 3) // Ignore "edges" that disagree with the encoders by more
+
 // Safety timeouts (stuck wheel, dead gyro, dead sensor)
 #define TURN_TIMEOUT_MS       3000
 #define MOVE_TIMEOUT_MS_CELL  2500
@@ -134,9 +143,41 @@ long readRightTicks() {
   interrupts();
   return ticks;
 }
-// Distance along the path = average of both wheels (steering corrections cancel out)
+// Distance along the path. Uses the left wheel only, because TICKS_PER_CELL was calibrated
+// on the left encoder.
 long readTravelTicks() {
-  return (labs(readLeftTicks()) + labs(readRightTicks())) / 2;
+  return labs(readLeftTicks());
+}
+
+// Tracks one side sensor while driving and reports the tick count where its wall ended.
+struct EdgeTracker {
+  bool hadWall;
+  long openSince; // Tick count where the wall first looked gone, -1 = wall present
+};
+
+// Returns the tick position of a confirmed wall end, or -1
+long trackEdge(EdgeTracker &t, int raw, long traveled) {
+  if (raw < WALL_THRESHOLD_MM) {
+    t.hadWall = true;
+    t.openSince = -1;
+    return -1;
+  }
+  if (!t.hadWall) return -1;
+  if (t.openSince < 0) t.openSince = traveled;
+  if (traveled - t.openSince < EDGE_CONFIRM_TICKS) return -1;
+  t.hadWall = false; // Need to see a wall again before the next edge
+  return t.openSince;
+}
+
+// Move the stop point so it is EDGE_TO_CENTER_TICKS past the edge (plus whole cells if the
+// straight continues). Returns the corrected target.
+long correctTargetFromEdge(long targetTicks, long edgeAt) {
+  long firstCenter = edgeAt + EDGE_TO_CENTER_TICKS;
+  long cellsAfter = (targetTicks - firstCenter + TICKS_PER_CELL / 2) / TICKS_PER_CELL;
+  if (cellsAfter < 0) cellsAfter = 0;
+  long corrected = firstCenter + cellsAfter * TICKS_PER_CELL;
+  if (labs(corrected - targetTicks) > EDGE_MAX_SHIFT_TICKS) return targetTicks;
+  return corrected;
 }
 void resetEncoders() {
   noInterrupts();
@@ -390,6 +431,9 @@ void moveForwardCells(int cells, bool speedRun) {
 
   avgLeft = 999;  // Seeded by the first valid reading
   avgRight = 999;
+  EdgeTracker leftEdge = { false, -1 };
+  EdgeTracker rightEdge = { false, -1 };
+  bool edgeCorrected = false;
 
   while (true) {
     long traveled = readTravelTicks();
@@ -427,8 +471,23 @@ void moveForwardCells(int cells, bool speedRun) {
 
     float gyroError = targetHeading - heading;
 
-    avgLeft = smoothSide(avgLeft, getTrueLeft());
-    avgRight = smoothSide(avgRight, getTrueRight());
+    int rawLeft = getTrueLeft();
+    int rawRight = getTrueRight();
+    avgLeft = smoothSide(avgLeft, rawLeft);
+    avgRight = smoothSide(avgRight, rawRight);
+
+    long edgeAt = trackEdge(leftEdge, rawLeft, traveled);
+    long rightEdgeAt = trackEdge(rightEdge, rawRight, traveled);
+    if (rightEdgeAt > edgeAt) edgeAt = rightEdgeAt;
+    if (edgeAt >= 0) {
+      long corrected = correctTargetFromEdge(targetTicks, edgeAt);
+      if (corrected != targetTicks) {
+        Serial.print("Wall edge: target "); Serial.print(targetTicks);
+        Serial.print(" -> "); Serial.println(corrected);
+        targetTicks = corrected;
+        edgeCorrected = true;
+      }
+    }
 
     bool hasLeft = (avgLeft < WALL_THRESHOLD_MM);
     bool hasRight = (avgRight < WALL_THRESHOLD_MM);
@@ -448,6 +507,12 @@ void moveForwardCells(int cells, bool speedRun) {
     setMotors(base - correction, base + rightTrim + correction);
   }
   settle(300); // Wait for chassis to settle
+
+  // Diagnostics: L and R should be close; edge=0 on every move means the correction never fires
+  Serial.print("  ticks L="); Serial.print(readLeftTicks());
+  Serial.print(" R="); Serial.print(readRightTicks());
+  Serial.print(" target="); Serial.print(targetTicks);
+  Serial.print(" edge="); Serial.println(edgeCorrected ? 1 : 0);
 }
 
 // Rotate in place by `degrees` (+ = left). The target is kept as an exact multiple of 90, so
