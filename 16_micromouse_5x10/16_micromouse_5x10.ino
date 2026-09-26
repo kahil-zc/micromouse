@@ -5,9 +5,10 @@
 // ║  Robot: 99 x 126 mm, axle 47 mm behind the front.                ║
 // ║                                                                  ║
 // ║  Button (START), robot in the start cell, back to the wall:      ║
-// ║    1st press  = EXPLORE: map every cell it can reach, always     ║
-// ║                 going to the nearest unmapped cell, then drive   ║
-// ║                 home                                             ║
+// ║    1st press  = EXPLORE: search until it finds the goal (never   ║
+// ║                 gives up while there is somewhere new to go),    ║
+// ║                 then only visit cells that could give a shorter  ║
+// ║                 path, then drive home                            ║
 // ║    every press after that = SPEED RUN to the goal and back home  ║
 // ║    long press (1 s, LED on) = explore again                      ║
 // ║    press while exploring = stop and drive home                   ║
@@ -18,11 +19,12 @@
 // ║  four cells meet around a post with no wall touching it. The     ║
 // ║  robot also works out which corner it started in.                ║
 // ║                                                                  ║
-// ║  Exploring drives into every cell and reads its walls there. It  ║
-// ║  always heads for the nearest unmapped cell, skips cells whose   ║
-// ║  four walls it already saw from next door, and drives straight   ║
-// ║  through mapped cells without stopping. Every stop is printed on ║
-// ║  Serial (cell, readings, walls, where it goes next).             ║
+// ║  Exploring always goes somewhere new: the nearest unmapped cell, ║
+// ║  straight ahead first. It never drives back to look at a cell it ║
+// ║  has already mapped, and drives through mapped cells without     ║
+// ║  stopping. It explores slowly, and in every new cell it reads    ║
+// ║  the walls for a quarter of a second and pulls up to the front   ║
+// ║  wall to fix its position. Every stop is printed on Serial.      ║
 // ║                                                                  ║
 // ║  How the ToFs are used:                                          ║
 // ║   * Sides, every 5 ms: steer toward the corridor centre.         ║
@@ -129,8 +131,8 @@
 // === DRIVING ===
 #define TICKS_PER_CELL      290
 #define TICKS_PER_MM        (TICKS_PER_CELL / CELL_MM)
-#define DRIVE_PWM           160    // into an unmapped cell
-#define KNOWN_PWM           190    // through mapped cells while exploring, and home after a speed run
+#define DRIVE_PWM           130    // into an unmapped cell (slow: time to read the walls well)
+#define KNOWN_PWM           170    // through mapped cells while exploring, and home after a speed run
 #define SPEED_RUN_PWM       220
 #define MIN_DRIVE_PWM        80
 #define ACCEL_PWM_PER_MM    2.0f   // ramp up over the first ~40 mm
@@ -158,8 +160,8 @@
 #define ARC_MIN_PWM         90
 #define ARC_MAX_PWM         170
 #define ARC_KT              4.0f   // extra inner-wheel PWM per tick it lags behind the arc
-#define ARC_MIN_MARGIN_MM   6.0f   // shuffle toward the turn if the outer wall is closer than this
-#define ARC_TARGET_MARGIN_MM 9.0f
+#define ARC_MIN_MARGIN_MM   3.0f   // shuffle toward the turn only if the outer wall is closer than this
+#define ARC_TARGET_MARGIN_MM 6.0f
 #define KP_SPIN             2.5f
 #define SPIN_MIN_PWM        60
 #define SPIN_MAX_PWM        100
@@ -167,6 +169,7 @@
 #define TURN_SETTLE_DPS     20.0f
 #define TURN_TIMEOUT_MS     3000
 #define ALIGN_TOL_MM        2
+#define SETTLE_TOL_MM       20.0f  // before a turn, only back up to the decision point if this far off
 #define SHIFT_TOL_MM        1.5f   // don't shuffle for less than this
 #define SHIFT_ANGLE_DEG     12.0f  // heading used for the sideways shuffle
 #define MAX_SHIFT_MM        15.0f
@@ -174,6 +177,8 @@
 #define GYRO_SCALE          65.5f  // 500 deg/s range; bigger number = turns further
 #define GYRO_CALIB_SAMPLES  200
 #define MAX_FAILS           3      // consecutive failed moves before giving up
+#define SENSE_MS            250    // how long to average the ToFs when reading a new cell
+#define MAX_IMPROVE_CELLS   60     // after the goal, map at most this many cells looking for a shorter path
 #define LONG_PRESS_MS       1000
 #define DOUBLE_CLICK_MS     400    // second press within this = double click
 #define EEPROM_MAGIC        (0xD0 ^ MAZE_W ^ (MAZE_H << 4))
@@ -242,13 +247,14 @@ WallFit fitL, fitR;
 // This section is compiled on a PC by tests/micromouse_5x10_sim.sh and run on random mazes.
 // Directions: 0 = ahead (+y), 1 = right (+x), 2 = back, 3 = left, as seen from the start.
 // Right of d is (d + 1) & 3.
-#define PH_EXPLORE  0   // mapping every reachable cell
-#define PH_HOME     1   // driving home, still mapping any new cell on the way
-#define PH_FAST     2   // speed run to the goal on mapped walls only
-#define PH_RETURN   3   // home after a speed run
-#define PH_DONE     4   // in the start cell
+#define PH_EXPLORE  0   // searching for the goal
+#define PH_IMPROVE  1   // goal found: mapping only cells that could give a shorter path
+#define PH_HOME     2   // driving home, still mapping any new cell on the way
+#define PH_FAST     3   // speed run to the goal on mapped walls only
+#define PH_RETURN   4   // home after a speed run
+#define PH_DONE     5   // in the start cell
 
-#define MAX_TARGETS 4
+#define MAX_TARGETS 12
 #define MAX_RUN     17  // most cells driven in one straight
 
 const int8_t DX[4] = { 0, 1, 0, -1 };
@@ -265,6 +271,7 @@ int8_t goalX = 0, goalY = 0;   // lower-left cell of the 2x2 goal
 int8_t exploreX = -1, exploreY = -1;  // unmapped cell the robot is heading for
 uint8_t phase = PH_DONE;
 bool noRoute = false;          // the last plan found no way to its targets
+uint16_t newCells = 0;         // cells mapped in the current phase
 
 int8_t tgX[MAX_TARGETS], tgY[MAX_TARGETS];
 uint8_t tgN = 0;
@@ -277,6 +284,7 @@ bool visited(int x, int y) { return (maze[x][y] & 0xF0) == 0xF0; }  // all four 
 // Records one wall on both cells that share it. The outer boundary always stays a wall.
 // sticky = keep a wall that is already there (for less certain, long-range readings).
 void putWall(int x, int y, uint8_t d, bool present, bool sticky) {
+  if (!inMaze(x, y)) return;  // never write outside the map
   int nx = x + DX[d], ny = y + DY[d];
   if (!inMaze(nx, ny)) present = true;
   if (sticky && (maze[x][y] & (1 << d))) return;
@@ -432,6 +440,37 @@ uint8_t knownPathLength() {
   return dist[startX][0];
 }
 
+// Shortest start-to-goal length: optimistic (unknown walls open) and on known walls only.
+// Equal = the known path is proven shortest.
+void pathLengths(uint8_t &optimistic, uint8_t &known) {
+  targetGoal();
+  flood(true);
+  known = dist[startX][0];
+  flood(false);
+  optimistic = dist[startX][0];
+}
+
+// Targets after the goal: unmapped cells on the best possible start-to-goal path. None left
+// (or the known path already as short as possible) = proven, go home.
+bool improveTargets() {
+  uint8_t optimistic, known;
+  pathLengths(optimistic, known);  // leaves the optimistic flood in dist
+  if (optimistic == 255 || known == optimistic) return false;
+  int8_t cx[MAX_TARGETS], cy[MAX_TARGETS];
+  uint8_t n = 0;
+  int x = startX, y = 0;
+  uint8_t f = 0;
+  for (int steps = 0; steps < MAZE_W * MAZE_H && dist[x][y] != 0 && n < MAX_TARGETS; steps++) {
+    uint8_t d = bestDir(x, y, f, false);
+    if (d == 255) break;
+    x += DX[d]; y += DY[d]; f = d;
+    if (!visited(x, y)) { cx[n] = x; cy[n] = y; n++; }
+  }
+  tgN = 0;
+  for (uint8_t i = 0; i < n; i++) addTarget(cx[i], cy[i]);
+  return tgN > 0;
+}
+
 // Floods toward the current targets and picks the next straight. 0 = already on a target or
 // no route (noRoute set).
 uint8_t driveTo(bool pessimistic, bool stopAtUnmapped, uint8_t &dir) {
@@ -450,7 +489,11 @@ uint8_t plan(uint8_t &dir) {
   switch (phase) {
     case PH_EXPLORE:
       findGoal();
-      if (!exploreTargets()) { phase = PH_HOME; return 0; }
+      if (goalKnown) { phase = PH_IMPROVE; newCells = 0; return 0; }
+      if (!exploreTargets()) { phase = PH_HOME; return 0; }  // nowhere new left and no goal
+      return driveTo(false, true, dir);
+    case PH_IMPROVE:
+      if (newCells >= MAX_IMPROVE_CELLS || !improveTargets()) { phase = PH_HOME; return 0; }
       return driveTo(false, true, dir);
     case PH_HOME:
       findGoal();
@@ -648,7 +691,7 @@ void updateToF() {
 void sense() {
   updateGyro();
   updateToF();
-  if (runState == ST_RUN && phase == PH_EXPLORE && digitalRead(START_BUTTON) == LOW)
+  if (runState == ST_RUN && (phase == PH_EXPLORE || phase == PH_IMPROVE) && digitalRead(START_BUTTON) == LOW)
     abortExploration = true;
 }
 
@@ -657,10 +700,10 @@ void senseFor(unsigned long ms) {
   while (millis() - start < ms) { sense(); delay(2); }
 }
 
-// Averages all three readings over ~150 ms while standing still. 999 = nothing in range.
+// Averages all three readings over SENSE_MS while standing still. 999 = nothing in range.
 void averageAll(float &l, float &f, float &r) {
   accL = accF = accR = 0; cntL = cntF = cntR = 0;
-  senseFor(150);
+  senseFor(SENSE_MS);
   l = cntL ? (float)accL / cntL : 999;
   f = cntF ? (float)accF / cntF : 999;
   r = cntR ? (float)accR / cntR : 999;
@@ -1071,7 +1114,7 @@ void settleAtDecisionPoint() {
   if (tofF < FRONT_WALL_THRESHOLD_MM) {
     alignToFrontWall(FRONT_GAP_MM);
     carryMm = 0;
-  } else if (fabs(carryMm) > 5 && !(backToWall && carryMm > 0)) {
+  } else if (fabs(carryMm) > SETTLE_TOL_MM && !(backToWall && carryMm > 0)) {
     driveStraight(-carryMm, 90, false, false, NAN);
     carryMm = 0;
   }
@@ -1151,6 +1194,11 @@ void senseWallsHere() {
   Serial.print(F(" R ")); Serial.print((int)r);
   Serial.print(F("  walls: ")); Serial.print(wallL ? 'L' : '-'); Serial.print(wallF ? 'F' : '-');
   Serial.println(wallR ? 'R' : '-');
+  // A wall ahead gives an exact position: creep to the decision-point distance from it.
+  if (wallF && !backToWall && fabs(f - FRONT_GAP_MM) > ALIGN_TOL_MM) {
+    alignToFrontWall(FRONT_GAP_MM);
+    carryMm = 0;
+  }
 }
 
 // Before driving n cells: the front ToF must not see a wall the map says isn't there.
@@ -1172,26 +1220,26 @@ uint8_t checkAhead(uint8_t n) {
 
 void saveMaze() {
   EEPROM.update(0, EEPROM_MAGIC);
-  const uint8_t *p = &maze[0][0];
-  int i = 0;
-  for (; i < MAZE_W * MAZE_H; i++) EEPROM.update(1 + i, p[i]);
-  EEPROM.update(1 + i, goalKnown);
-  EEPROM.update(2 + i, goalX);
-  EEPROM.update(3 + i, goalY);
-  EEPROM.update(4 + i, startX);
-  EEPROM.update(5 + i, cornerKnown);
+  int addr = 1;
+  for (int x = 0; x < MAZE_W; x++)
+    for (int y = 0; y < MAZE_H; y++) EEPROM.update(addr++, maze[x][y]);
+  EEPROM.update(addr++, goalKnown);
+  EEPROM.update(addr++, goalX);
+  EEPROM.update(addr++, goalY);
+  EEPROM.update(addr++, startX);
+  EEPROM.update(addr++, cornerKnown);
 }
 
 bool loadMaze() {
   if (EEPROM.read(0) != EEPROM_MAGIC) return false;
-  uint8_t *p = &maze[0][0];
-  int i = 0;
-  for (; i < MAZE_W * MAZE_H; i++) p[i] = EEPROM.read(1 + i);
-  goalKnown = EEPROM.read(1 + i);
-  goalX = EEPROM.read(2 + i);
-  goalY = EEPROM.read(3 + i);
-  startX = EEPROM.read(4 + i);
-  cornerKnown = EEPROM.read(5 + i);
+  int addr = 1;
+  for (int x = 0; x < MAZE_W; x++)
+    for (int y = 0; y < MAZE_H; y++) maze[x][y] = EEPROM.read(addr++);
+  goalKnown = EEPROM.read(addr++);
+  goalX = EEPROM.read(addr++);
+  goalY = EEPROM.read(addr++);
+  startX = EEPROM.read(addr++);
+  cornerKnown = EEPROM.read(addr++);
   if (startX != 0 && startX != MAZE_W - 1) return false;
   return true;
 }
@@ -1283,6 +1331,7 @@ void beginRun(uint8_t firstPhase) {
   putWall(startX, 0, 2, true, false);
   abortExploration = false;
   exploreX = exploreY = -1;
+  newCells = 0;
   phase = firstPhase;
   runState = ST_RUN;
 }
@@ -1305,11 +1354,18 @@ void finishAtHome() {
 
 // Says what happened when the plan moves to a new phase.
 void announcePhase(uint8_t from) {
-  if (from == PH_EXPLORE && phase == PH_HOME) {
-    Serial.println(F("\n*** MAP COMPLETE *** heading home"));
+  if (from == PH_EXPLORE && phase == PH_IMPROVE) {
+    Serial.println(F("\n*** GOAL FOUND ***"));
     saveMaze();
     printMaze();
     blink(5);
+    Serial.println(F("Checking cells that could give a shorter path..."));
+  } else if (from == PH_EXPLORE && phase == PH_HOME) {
+    Serial.println(F("\nEverything reachable is mapped but no goal room was found - heading home"));
+  } else if (from == PH_IMPROVE && phase == PH_HOME) {
+    Serial.println(newCells >= MAX_IMPROVE_CELLS ? F("Exploration limit reached - heading home")
+                                                 : F("Shortest path proven - heading home"));
+    saveMaze();
   } else if (from == PH_FAST && phase == PH_RETURN) {
     Serial.println(F("\n*** SPEED RUN DONE *** heading home"));
     blink(5);
@@ -1321,9 +1377,9 @@ void announcePhase(uint8_t from) {
 
 // One move of a run: map this cell if new, plan, turn, check the corridor, drive.
 void runStep() {
-  bool mapping = phase == PH_EXPLORE || phase == PH_HOME;
-  if (mapping && !visited(posX, posY)) senseWallsHere();
-  if (abortExploration && phase == PH_EXPLORE) {
+  bool mapping = phase == PH_EXPLORE || phase == PH_IMPROVE || phase == PH_HOME;
+  if (mapping && !visited(posX, posY)) { senseWallsHere(); newCells++; }
+  if (abortExploration && (phase == PH_EXPLORE || phase == PH_IMPROVE)) {
     Serial.println(F("Exploring stopped - heading home"));
     abortExploration = false;
     phase = PH_HOME;

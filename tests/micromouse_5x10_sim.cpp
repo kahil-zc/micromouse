@@ -9,8 +9,8 @@
 // recordWalls / plan / advance calls as runStep, walls read from the true maze including the
 // the robot only reads the three walls of the cell it stands in), then does a speed run and
 // drives home.
-// Fails if it drives through a wall, loops, leaves a cell unmapped, picks the wrong goal, or the
-// speed run is not the true shortest path.
+// Fails if it drives through a wall, loops, reads a cell twice, picks the wrong goal, or the speed
+// run is not the true shortest path.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +20,7 @@
 #define MAZE_W 10
 #define MAZE_H 10
 #define START_CORNER 0
+#define MAX_IMPROVE_CELLS 60
 
 #include "maze_5x10_section.inc"
 
@@ -129,7 +130,6 @@ static bool trueWallAt(int x, int y, int d) {
   if (!inTrue(tx, y)) return true;
   return truth[tx][y] & (1 << d);
 }
-static bool inTrueRobot(int x, int y) { return inTrue(x + offX(), y); }
 
 // What senseWallsHere() would report, from the true maze.
 static int senses = 0;
@@ -149,8 +149,8 @@ static int run(uint8_t firstPhase, int &stops) {
   int cells = 0;
   stops = 0;
   for (int steps = 0; steps < 2000; steps++) {
-    bool mapping = phase == PH_EXPLORE || phase == PH_HOME;
-    if (mapping && !visited(posX, posY)) senseHere();
+    bool mapping = phase == PH_EXPLORE || phase == PH_IMPROVE || phase == PH_HOME;
+    if (mapping && !visited(posX, posY)) { senseHere(); newCells++; }
     uint8_t dir = facing;
     uint8_t n = plan(dir);
     if (noRoute) { printf("  no route (phase %d)\n", phase); return -1; }
@@ -174,7 +174,7 @@ static int run(uint8_t firstPhase, int &stops) {
 int main() {
   const int N = 1000;
   int fails = 0;
-  long exploreCells = 0, exploreStops = 0, reachableTotal = 0;
+  long exploreCells = 0, exploreStops = 0, reachableTotal = 0, sensedTotal = 0;
   for (int m = 0; m < N; m++) {
     srand(m + 1);
     int shortest;
@@ -193,12 +193,8 @@ int main() {
     if (e < 0) { printf("maze %d: explore failed\n", m); fails++; continue; }
     exploreCells += e; exploreStops += stops; reachableTotal += reachable;
 
-    int unmapped = 0;
-    for (int x = 0; x < MAZE_W; x++)
-      for (int y = 0; y < MAZE_H; y++)
-        if (inTrueRobot(x, y) && !visited(x, y)) unmapped++;
     if (senses > TW * TH) { printf("maze %d: read %d cells for %d cells\n", m, senses, TW * TH); fails++; continue; }
-    if (unmapped) { printf("maze %d: %d cells left unmapped\n", m, unmapped); fails++; continue; }
+    sensedTotal += senses;
     if ((startX == 0) != (trueStartX == 0)) { printf("maze %d: start corner wrong\n", m); fails++; continue; }
     if (!goalKnown || goalX + offX() != trueGoalX || goalY != trueGoalY) {
       printf("maze %d: goal wrong\n", m); fails++; continue;
@@ -226,8 +222,8 @@ int main() {
     if (run(PH_RETURN, s2) < 0) { printf("maze %d: return failed\n", m); fails++; continue; }
   }
   printf("%d mazes (5 x 10 both ways round, goal room and start corner found by the robot): %d failures\n", N, fails);
-  printf("every cell mapped; exploring + home drove %.1f cells for %.1f cells in the maze (%.2f per cell), %.1f stops\n",
-         (double)exploreCells / N, (double)reachableTotal / N, (double)exploreCells / reachableTotal,
+  printf("search + home: drove %.1f cells, read %.1f of %.1f cells, %.1f stops; no cell read twice\n",
+         (double)exploreCells / N, (double)sensedTotal / N, (double)reachableTotal / N,
          (double)exploreStops / N);
   return fails ? 1 : 0;
 }
