@@ -1,17 +1,20 @@
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  13_swing_turn_explorer                                          ║
-// ║  Right-hand explore -> return home -> speed run, sized for a     ║
-// ║  90 x 135 mm robot.                                              ║
+// ║  Right-hand explore -> return home -> speed run, for a 99 x 126  ║
+// ║  mm robot whose axle is 47 mm behind the front.                  ║
 // ║                                                                  ║
-// ║  Turning in place needs a 162 mm circle for this body, and the   ║
-// ║  corridor is 168 mm, so spins scrape the walls. Instead:         ║
-// ║   * 90° turns pivot on the INNER wheel, started TURN_BACKOFF_MM  ║
-// ║     before the cell centre. The pivot sits on the turning side   ║
-// ║     (the "hug the turn side + back up" idea) without having to   ║
-// ║     slide sideways, and the turn ends centred in the new         ║
-// ║     corridor.                                                    ║
-// ║   * U-turns (dead ends, nowhere to swing) shuffle to the exact   ║
-// ║     centre first, then spin toward the side with more room.      ║
+// ║  The rear corners are 93 mm from the axle and the corridor is    ║
+// ║  84 mm from centre to wall, so this robot cannot spin in place   ║
+// ║  in the middle of a corridor. Instead:                           ║
+// ║   * 90° turns are 80 mm-radius arcs, started 80 mm before the    ║
+// ║     cell centre. They end centred in the new corridor with       ║
+// ║     ~12 mm between the rear corner and the outer wall. If the    ║
+// ║     robot is too close to the outer wall it first shuffles       ║
+// ║     sideways toward the turn.                                    ║
+// ║   * U-turns spin in place after shuffling ~12 mm toward the side ║
+// ║     the front corners sweep, so the long rear gets the room.     ║
+// ║   * Position along the corridor is corrected by the front wall   ║
+// ║     and by side-wall edges (where a wall starts or ends).        ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 #include <Wire.h>
@@ -46,29 +49,47 @@
 #define LEFT_BIAS_MM   25
 #define RIGHT_BIAS_MM  50
 
-// === ROBOT GEOMETRY — MEASURE THE TWO MARKED VALUES ===
-#define ROBOT_WIDTH_MM     90.0f
-#define ROBOT_LENGTH_MM   135.0f
-#define AXLE_TO_FRONT_MM   67.5f   // MEASURE: wheel axle centre line -> front edge of the robot
-#define TRACK_WIDTH_MM     80.0f   // MEASURE: middle of left tyre -> middle of right tyre
+// === ROBOT GEOMETRY ===
+#define ROBOT_WIDTH_MM     99.0f
+#define ROBOT_LENGTH_MM   126.0f
+#define AXLE_TO_FRONT_MM   47.0f   // front ToF sits at the front edge
+#define SIDE_TOF_AHEAD_MM  32.0f   // side ToFs are this far in front of the axle
+#define TRACK_WIDTH_MM     88.0f   // MEASURE: middle of left tyre -> middle of right tyre
 
 // === MAZE ===
 #define CELL_MM           180.0f
 #define HALF_CORRIDOR_MM   84.0f   // cell centre -> wall face, (180 - 12 mm wall) / 2
+#define POST_HALF_MM        6.0f
 
-// Derived geometry. The robot's position is its axle midpoint (the point it spins about).
-// Decision point = axle TURN_BACKOFF_MM before the cell centre. The robot stops there in every
-// cell; a swing turn started there ends centred in the new corridor.
+// === TURN GEOMETRY ===
+#define TURN_RADIUS_MM     80.0f   // arc radius of 90° turns (axle path)
+#define SAFETY_MM           3.0f   // extra room kept around the corners in U-turns
+
+// Derived geometry. The robot's position is its axle midpoint.
+// Decision point = axle TURN_RADIUS_MM before the cell centre. The robot stops there in every
+// cell; an arc turn started there ends centred in the new corridor.
 #define HALF_WIDTH_MM      (ROBOT_WIDTH_MM / 2.0f)
 #define HALF_TRACK_MM      (TRACK_WIDTH_MM / 2.0f)
 #define AXLE_TO_REAR_MM    (ROBOT_LENGTH_MM - AXLE_TO_FRONT_MM)
-#define TURN_BACKOFF_MM    HALF_TRACK_MM
-#define SIDE_GAP_MM        (HALF_CORRIDOR_MM - HALF_WIDTH_MM)                       // centred side reading, ~39
-#define FRONT_GAP_MM       (HALF_CORRIDOR_MM + TURN_BACKOFF_MM - AXLE_TO_FRONT_MM)  // front reading at decision point, ~56
+#define DECISION_BACK_MM   TURN_RADIUS_MM
+#define SIDE_GAP_MM        (HALF_CORRIDOR_MM - HALF_WIDTH_MM)                         // centred side reading, ~34.5
+#define FRONT_GAP_MM       (HALF_CORRIDOR_MM + DECISION_BACK_MM - AXLE_TO_FRONT_MM)   // front reading at decision point, ~117
+#define ARC_RATIO          ((TURN_RADIUS_MM - HALF_TRACK_MM) / (TURN_RADIUS_MM + HALF_TRACK_MM))  // inner / outer wheel speed
+#define ARC_OUTER_REACH_MM (sqrt(sq(TURN_RADIUS_MM + HALF_WIDTH_MM) + sq(AXLE_TO_REAR_MM)) - TURN_RADIUS_MM)
+#define SPIN_R_FRONT_MM    (sqrt(sq(AXLE_TO_FRONT_MM) + sq(HALF_WIDTH_MM)))  // ~68
+#define SPIN_R_REAR_MM     (sqrt(sq(AXLE_TO_REAR_MM) + sq(HALF_WIDTH_MM)))   // ~93
+#define U_TURN_FRONT_GAP_MM (SPIN_R_REAR_MM - AXLE_TO_FRONT_MM + SAFETY_MM)  // rear swings through the front, ~49
 
 // === WALL DETECTION ===
-#define WALL_THRESHOLD_MM   130                 // wall present in this cell
-#define SIDE_FOLLOW_MM      (SIDE_GAP_MM + 35)  // only centre on side walls closer than this
+#define WALL_THRESHOLD_MM        130                    // side wall present in this cell
+#define FRONT_WALL_THRESHOLD_MM  (FRONT_GAP_MM + 70)    // front wall present in this cell (next one is 180 further)
+#define FRONT_LOOK_MM            (FRONT_GAP_MM + 110)   // start braking for a front wall from here
+#define SIDE_FOLLOW_MM           (SIDE_GAP_MM + 35)     // side wall close enough to centre on
+
+// === SIDE-WALL EDGE CORRECTION ===
+#define EDGE_BEAM_MM        5.0f   // CAL: how far past a wall end the side reading still sees the wall
+#define EDGE_MIN_RUN_MM    25.0f   // wall/gap must last this long before its edge is trusted
+#define EDGE_MAX_CORR_MM   30.0f   // ignore edges that disagree with the encoders by more than this
 
 // === DRIVING ===
 #define TICKS_PER_CELL      290
@@ -77,27 +98,30 @@
 #define SPEED_RUN_PWM       220
 #define MIN_DRIVE_PWM        80
 #define ACCEL_PWM_PER_MM    2.0f   // ramp up over the first ~40 mm
-#define DECEL_PWM_PER_MM    1.5f   // ramp down over the last ~50 mm
+#define DECEL_PWM_PER_MM    1.5f   // ramp down over the last ~50-90 mm
 #define STALL_MS            500
 
 // === STEERING (gyro holds heading, side walls nudge the heading target) ===
 #define KP                  5.0f
 #define KD                  0.2f
-#define WALL_KP             0.25f  // degrees of heading nudge per mm of lateral error
-#define MAX_WALL_NUDGE_DEG  5.0f
+#define WALL_KP             0.5f   // degrees of heading nudge per mm of lateral error
+#define MAX_WALL_NUDGE_DEG  8.0f
 
 // === TURNS ===
-#define KP_SWING            3.0f
-#define SWING_MIN_PWM       70     // one wheel does all the work, needs more than a spin
-#define SWING_MAX_PWM       150
+#define KP_ARC              3.0f
+#define ARC_MIN_PWM         90
+#define ARC_MAX_PWM         170
+#define ARC_KT              4.0f   // extra inner-wheel PWM per tick it lags behind the arc
+#define ARC_MIN_MARGIN_MM   6.0f   // shuffle toward the turn if the outer wall is closer than this
+#define ARC_TARGET_MARGIN_MM 9.0f
 #define KP_SPIN             2.5f
 #define SPIN_MIN_PWM        60
 #define SPIN_MAX_PWM        100
 #define TURN_TOL_DEG        1.5f
 #define TURN_SETTLE_DPS     20.0f
-#define TURN_TIMEOUT_MS     2500
+#define TURN_TIMEOUT_MS     3000
 #define ALIGN_TOL_MM        2
-#define CENTER_TOL_MM       1.5f   // re-centre before a U-turn if further off than this
+#define SHIFT_TOL_MM        1.5f   // don't shuffle for less than this
 #define SHIFT_ANGLE_DEG     12.0f  // heading used for the sideways shuffle
 #define MAX_SHIFT_MM        15.0f
 
@@ -122,6 +146,7 @@ unsigned long lastGyroMicros = 0;
 int16_t lastGyroRaw = 0;
 
 int tofL = 999, tofF = 999, tofR = 999;
+uint8_t seqL = 0, seqR = 0;       // bump on every new side reading
 long accL = 0, accR = 0;          // side reading sums for averageSides()
 uint16_t cntL = 0, cntR = 0;
 
@@ -153,9 +178,13 @@ void rightEncoderISR() {
 void resetTicks() {
   noInterrupts(); encoderLeftTicks = 0; encoderRightTicks = 0; interrupts();
 }
+void readTicks(long &l, long &r) {
+  noInterrupts(); l = labs(encoderLeftTicks); r = labs(encoderRightTicks); interrupts();
+}
 float travelledMm() {
-  noInterrupts(); long l = encoderLeftTicks, r = encoderRightTicks; interrupts();
-  return (labs(l) + labs(r)) / 2.0f / TICKS_PER_MM;  // abs of each: works whichever way the encoders count
+  long l, r;
+  readTicks(l, r);
+  return (l + r) / 2.0f / TICKS_PER_MM;  // abs of each: works whichever way the encoders count
 }
 
 // --- HARDWARE INIT FUNCTIONS ---
@@ -233,6 +262,7 @@ void updateToF() {
   if (sensorLeft.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) {
     uint16_t r = sensorLeft.readRangeContinuousMillimeters();
     tofL = (r > 8000) ? 999 : (int)r - LEFT_BIAS_MM;
+    seqL++;
     if (tofL != 999) { accL += tofL; cntL++; }
   }
   if (sensorFront.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) {
@@ -242,6 +272,7 @@ void updateToF() {
   if (sensorRight.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) {
     uint16_t r = sensorRight.readRangeContinuousMillimeters();
     tofR = (r > 8000) ? 999 : (int)r - RIGHT_BIAS_MM;
+    seqR++;
     if (tofR != 999) { accR += tofR; cntR++; }
   }
 }
@@ -319,13 +350,58 @@ float headingCorrection(bool useWalls) {
   return KP * (desired - absoluteHeading) - KD * gyroRate;
 }
 
+// --- SIDE-WALL EDGE CORRECTION ---
+// Posts sit on every cell boundary. When a side reading changes between wall and gap, the side
+// sensor is at a known spot (a post edge), which fixes the distance driven so far.
+struct SideEdge {
+  bool known, wall, pending;
+  float since, pendingAt;
+  uint8_t pendingCount;
+};
+
+void resetEdge(SideEdge &e) { e.known = false; e.pending = false; }
+
+// corrMm: running correction added to the encoder distance. startAxleMm: axle position at the
+// start of the drive, measured from the centre of the cell the drive started in.
+void edgeUpdate(SideEdge &e, int tof, float done, float &corrMm, float startAxleMm, char side) {
+  bool w = tof < SIDE_FOLLOW_MM;
+  if (!e.known) { e.known = true; e.wall = w; e.since = done; e.pending = false; return; }
+  if (w == e.wall) { e.pending = false; return; }
+  if (!e.pending) { e.pending = true; e.pendingAt = done; e.pendingCount = 1; return; }
+  if (++e.pendingCount < 2) return;  // two readings in a row: not noise
+
+  bool longEnough = (e.pendingAt - e.since) >= EDGE_MIN_RUN_MM;
+  e.wall = w; e.since = e.pendingAt; e.pending = false;
+  if (!longEnough) return;
+
+  // Boundary posts are centred on 180k + 90. A wall starts at the near face of a post and
+  // ends at its far face; the beam width shifts both slightly.
+  float edgeRel = w ? -(POST_HALF_MM + EDGE_BEAM_MM) : (POST_HALF_MM + EDGE_BEAM_MM);
+  float sensorY = startAxleMm + corrMm + e.pendingAt + SIDE_TOF_AHEAD_MM;
+  float k = round((sensorY - CELL_MM / 2 - edgeRel) / CELL_MM);
+  float trueY = k * CELL_MM + CELL_MM / 2 + edgeRel;
+  float c = trueY - sensorY;
+  if (fabs(c) < EDGE_MAX_CORR_MM) {
+    corrMm += c;
+    Serial.print(side); Serial.print(F(" edge, distance corrected by ")); Serial.println(c);
+  }
+}
+
 // --- MOVEMENT BEHAVIOURS ---
-// Drives distMm (negative = reverse) holding targetHeading. With stopAtWall it also stops at the
-// decision point of a front wall. Returns DRIVE_STALL, DRIVE_DONE or DRIVE_WALL.
-int driveStraight(float distMm, int maxPwm, bool stopAtWall) {
+// Drives distMm (negative = reverse) holding targetHeading.
+//  center:      steer toward the corridor centre using the side walls
+//  stopAtWall:  also stop at the decision point of a front wall
+//  startAxleMm: if not NAN, correct the distance at side-wall edges (see edgeUpdate)
+// Returns DRIVE_STALL, DRIVE_DONE or DRIVE_WALL.
+int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float startAxleMm) {
   bool reverse = distMm < 0;
   float goal = fabs(distMm);
+  bool useEdges = !reverse && !isnan(startAxleMm);
   int result = DRIVE_DONE;
+  float corr = 0;
+  SideEdge edgeL, edgeR;
+  resetEdge(edgeL); resetEdge(edgeR);
+  uint8_t lastSeqL = seqL, lastSeqR = seqR;
   resetTicks();
   float lastDone = 0;
   unsigned long lastProgress = millis(), lastLoop = 0;
@@ -333,9 +409,13 @@ int driveStraight(float distMm, int maxPwm, bool stopAtWall) {
   while (true) {
     sense();
     float done = travelledMm();
-    float remaining = goal - done;
+    if (useEdges) {
+      if (seqL != lastSeqL) { lastSeqL = seqL; edgeUpdate(edgeL, tofL, done, corr, startAxleMm, 'L'); }
+      if (seqR != lastSeqR) { lastSeqR = seqR; edgeUpdate(edgeR, tofR, done, corr, startAxleMm, 'R'); }
+    }
+    float remaining = goal - done - corr;
     bool wallLimited = false;
-    if (stopAtWall && !reverse && tofF < WALL_THRESHOLD_MM) {
+    if (stopAtWall && !reverse && tofF < FRONT_LOOK_MM) {
       float toWall = tofF - FRONT_GAP_MM;
       if (toWall < remaining) { remaining = toWall; wallLimited = true; }
     }
@@ -355,23 +435,28 @@ int driveStraight(float distMm, int maxPwm, bool stopAtWall) {
       float pwm = up < down ? up : down;
       if (pwm > maxPwm) pwm = maxPwm;
       if (reverse) pwm = -pwm;
-      float c = headingCorrection(!reverse);  // wall nudges would steer the wrong way in reverse
+      float c = headingCorrection(center && !reverse);  // wall nudges steer the wrong way in reverse
       setMotors((int)(pwm - c), (int)(pwm + c));
     }
   }
   stopMotors();
   senseFor(80);
-  lastOvershootMm = travelledMm() - goal;
+  lastOvershootMm = travelledMm() + corr - goal;
   return result;
 }
 
-// Creeps to exactly FRONT_GAP_MM from the front wall, holding heading.
-void alignToFrontWall() {
+// Brings the front of the robot to exactly gapMm from the front wall, holding heading.
+// Never steers sideways, so it keeps any sideways shuffle.
+void alignToFrontWall(float gapMm) {
+  sense();
+  if (tofF < FRONT_LOOK_MM + 60 && fabs(tofF - gapMm) > 20) {
+    driveStraight(tofF - gapMm - (tofF > gapMm ? 10 : -10), 110, false, false, NAN);
+  }
   unsigned long start = millis();
   while (millis() - start < 1000) {
     sense();
-    if (tofF >= WALL_THRESHOLD_MM) break;
-    float err = tofF - FRONT_GAP_MM;
+    if (tofF >= FRONT_LOOK_MM + 60) break;
+    float err = tofF - gapMm;
     if (fabs(err) <= ALIGN_TOL_MM) break;
     float v = constrain(err * 4.0f, -60.0f, 60.0f);
     if (fabs(v) < 45) v = (v > 0) ? 45 : -45;  // enough to overcome friction
@@ -383,12 +468,43 @@ void alignToFrontWall() {
   senseFor(60);
 }
 
-// Rotates to targetHeading. pivot: 0 = spin in place, +1 = pivot on the left wheel (left turn),
-// -1 = pivot on the right wheel (right turn).
-bool rotateToTarget(int pivot) {
-  float kp = pivot ? KP_SWING : KP_SPIN;
-  int minPwm = pivot ? SWING_MIN_PWM : SPIN_MIN_PWM;
-  int maxPwm = pivot ? SWING_MAX_PWM : SPIN_MAX_PWM;
+// Spins in place to targetHeading. Only safe for small angles, or after spinSafely() placed
+// the robot.
+bool rotateInPlace() {
+  unsigned long start = millis();
+  while (true) {
+    sense();
+    float err = targetHeading - absoluteHeading;
+    if (fabs(err) < TURN_TOL_DEG && fabs(gyroRate) < TURN_SETTLE_DPS) break;
+    if (millis() - start > TURN_TIMEOUT_MS) {
+      stopMotors();
+      Serial.println(F("TURN TIMEOUT (hit a wall?)"));
+      senseFor(80);
+      return false;
+    }
+    int pwm = constrain((int)(KP_SPIN * fabs(err)), SPIN_MIN_PWM, SPIN_MAX_PWM);
+    if (fabs(err) < TURN_TOL_DEG) pwm = 0;  // in tolerance: brake and let it settle
+    int s = (err > 0) ? pwm : -pwm;         // + = rotate counter-clockwise
+    setMotors(-s, s);
+    delay(2);
+  }
+  stopMotors();
+  senseFor(80);
+  return true;
+}
+
+bool spinTurn(float angleDeg) {
+  targetHeading += angleDeg;
+  return rotateInPlace();
+}
+
+// 90° arc of TURN_RADIUS_MM. dir: +1 = left, -1 = right.
+// The gyro drives the outer wheel; the inner wheel is held to ARC_RATIO of the outer wheel's
+// distance with the encoders.
+bool arcTurn(int dir) {
+  Serial.println(dir > 0 ? F("Arc LEFT") : F("Arc RIGHT"));
+  targetHeading += 90.0f * dir;
+  resetTicks();
   unsigned long start = millis();
 
   while (true) {
@@ -401,12 +517,23 @@ bool rotateToTarget(int pivot) {
       senseFor(80);
       return false;
     }
-    int pwm = constrain((int)(kp * fabs(err)), minPwm, maxPwm);
-    if (fabs(err) < TURN_TOL_DEG) pwm = 0;  // in tolerance: brake and let it settle
-    int s = (err > 0) ? pwm : -pwm;         // + = rotate counter-clockwise
-    if (pivot == 0)     setMotors(-s, s);
-    else if (pivot > 0) setMotors(0, s);    // left turn: right wheel drives around the left wheel
-    else                setMotors(-s, 0);   // right turn: left wheel drives around the right wheel
+
+    if (fabs(err) < TURN_TOL_DEG) {
+      stopMotors();                          // in tolerance: brake and let it settle
+    } else if (err * dir < 0) {
+      int s = (err > 0) ? SPIN_MIN_PWM : -SPIN_MIN_PWM;  // overshot: nudge back in place
+      setMotors(-s, s);
+    } else {
+      long l, r;
+      readTicks(l, r);
+      long outerTicks = (dir > 0) ? r : l;
+      long innerTicks = (dir > 0) ? l : r;
+      float outer = constrain(KP_ARC * fabs(err), (float)ARC_MIN_PWM, (float)ARC_MAX_PWM);
+      float inner = outer * ARC_RATIO + ARC_KT * (ARC_RATIO * outerTicks - innerTicks);
+      inner = constrain(inner, 0.0f, outer);
+      if (dir > 0) setMotors((int)inner, (int)outer);
+      else         setMotors((int)outer, (int)inner);
+    }
     delay(2);
   }
   stopMotors();
@@ -414,83 +541,113 @@ bool rotateToTarget(int pivot) {
   return true;
 }
 
-bool spinTurn(float angleDeg) {
-  targetHeading += angleDeg;
-  return rotateToTarget(0);
-}
-
-// dir: +1 = left, -1 = right
-bool swingTurn(int dir) {
-  Serial.println(dir > 0 ? F("Swing LEFT") : F("Swing RIGHT"));
-  targetHeading += 90.0f * dir;
-  return rotateToTarget(dir);
-}
-
-// Moves the robot sideways without turning the body far: tilt, reverse, tilt back, return.
-// mm > 0 = move left.
-void shiftSideways(float mm) {
+// Moves the robot sideways: tilt, reverse, tilt back, then drive forward again.
+// mm > 0 = move left. Ends at frontGapMm from the front wall if there is one.
+void shiftSideways(float mm, float frontGapMm) {
   mm = constrain(mm, -MAX_SHIFT_MM, MAX_SHIFT_MM);
   Serial.print(F("Shuffle sideways mm: ")); Serial.println(mm);
   float base = targetHeading;
   float back = fabs(mm) / sin(SHIFT_ANGLE_DEG * DEG_TO_RAD);
   spinTurn(mm > 0 ? -SHIFT_ANGLE_DEG : SHIFT_ANGLE_DEG);  // point the tail at the side we want
-  driveStraight(-back, 90, false);
+  driveStraight(-back, 90, false, false, NAN);
   targetHeading = base;
-  rotateToTarget(0);
+  rotateInPlace();
   sense();
-  if (tofF < WALL_THRESHOLD_MM) alignToFrontWall();
-  else driveStraight(back * cos(SHIFT_ANGLE_DEG * DEG_TO_RAD), 90, false);
+  if (tofF < FRONT_WALL_THRESHOLD_MM) alignToFrontWall(frontGapMm);
+  else driveStraight(back * cos(SHIFT_ANGLE_DEG * DEG_TO_RAD), 90, false, false, NAN);
 }
 
-// Dead end: spinning this body has only ~3 mm per side to spare, so centre exactly first,
-// then spin the way that gives the longer end of the robot the bigger gap.
-bool uTurn() {
-  Serial.println(F("U-TURN"));
+// Spins in place by angleDeg (±90 or 180). The rear corners swing 93 mm and the corridor is
+// 84 mm from centre to wall, so first pull up to the front wall and shuffle sideways toward the
+// side the front corners sweep, giving the long rear the room. For 180° the direction needing
+// the smaller shuffle is used.
+bool spinSafely(float angleDeg) {
+  sense();
+  if (tofF < FRONT_WALL_THRESHOLD_MM) alignToFrontWall(U_TURN_FRONT_GAP_MM);
+
   float l, r;
   averageSides(l, r);
-  if (l < WALL_THRESHOLD_MM && r < WALL_THRESHOLD_MM) {
-    float offset = (l - r) / 2.0f;  // > 0: robot is right of centre, move left
-    if (fabs(offset) > CENTER_TOL_MM) { shiftSideways(offset); averageSides(l, r); }
+  bool hasL = l < WALL_THRESHOLD_MM, hasR = r < WALL_THRESHOLD_MM;
+  float leftRoom = l + HALF_WIDTH_MM, rightRoom = r + HALF_WIDTH_MM;  // axle -> wall
+  float width = (hasL && hasR) ? l + r + ROBOT_WIDTH_MM : 2 * HALF_CORRIDOR_MM;
+  // Clockwise: rear corners sweep the left wall, front corners the right wall.
+  float cwLeft  = (width + SPIN_R_REAR_MM - SPIN_R_FRONT_MM) / 2;  // balanced axle -> left wall
+  float ccwLeft = (width - SPIN_R_REAR_MM + SPIN_R_FRONT_MM) / 2;
+
+  bool cw;
+  if (fabs(angleDeg) > 135) {
+    if (hasL && hasR) cw = fabs(leftRoom - cwLeft) <= fabs(leftRoom - ccwLeft);
+    else cw = !hasL;  // swing the rear toward the open side
+  } else {
+    cw = angleDeg < 0;
   }
-  float leftRoom  = (l < WALL_THRESHOLD_MM ? l : 150) + HALF_WIDTH_MM;
-  float rightRoom = (r < WALL_THRESHOLD_MM ? r : 150) + HALF_WIDTH_MM;
-  float rf = sqrt(sq(AXLE_TO_FRONT_MM) + sq(HALF_WIDTH_MM));
-  float rr = sqrt(sq(AXLE_TO_REAR_MM) + sq(HALF_WIDTH_MM));
-  // Clockwise: front corners sweep the right wall, rear corners the left wall.
-  float cwMargin  = min(rightRoom - rf, leftRoom - rr);
-  float ccwMargin = min(leftRoom - rf, rightRoom - rr);
-  return spinTurn(cwMargin >= ccwMargin ? -180.0f : 180.0f);
+
+  float needL = (cw ? SPIN_R_REAR_MM : SPIN_R_FRONT_MM) + SAFETY_MM;
+  float needR = (cw ? SPIN_R_FRONT_MM : SPIN_R_REAR_MM) + SAFETY_MM;
+  float shiftLeft = 0;  // > 0 = move left
+  if (hasL && hasR)            shiftLeft = leftRoom - (cw ? cwLeft : ccwLeft);
+  else if (hasL && leftRoom < needL)  shiftLeft = leftRoom - needL;
+  else if (hasR && rightRoom < needR) shiftLeft = needR - rightRoom;
+  if (fabs(shiftLeft) > SHIFT_TOL_MM && !atStartWall) shiftSideways(shiftLeft, U_TURN_FRONT_GAP_MM);
+
+  Serial.println(cw ? F("Spin CW") : F("Spin CCW"));
+  return spinTurn(cw ? -fabs(angleDeg) : fabs(angleDeg));
 }
 
-// Puts the axle on the decision point before a turn: the front wall if there is one,
+// Before an arc: if the robot is too close to the wall the rear corner swings toward,
+// shuffle toward the turn side. That shift only moves the end point along the new corridor,
+// not sideways, so it costs nothing after the turn.
+void prepareArc(int dir) {
+  if (atStartWall) return;
+  float l, r;
+  averageSides(l, r);
+  float outerGap = (dir < 0) ? l : r;  // right turn: rear corner swings toward the left wall
+  float innerGap = (dir < 0) ? r : l;
+  if (outerGap >= WALL_THRESHOLD_MM) return;  // no outer wall
+  float margin = outerGap + HALF_WIDTH_MM - ARC_OUTER_REACH_MM;
+  if (margin >= ARC_MIN_MARGIN_MM) return;
+  float shift = ARC_TARGET_MARGIN_MM - margin;
+  if (innerGap < WALL_THRESHOLD_MM) shift = min(shift, innerGap - 12.0f);  // don't hit the inner wall
+  if (shift <= SHIFT_TOL_MM) return;
+  shiftSideways(dir < 0 ? -shift : shift, FRONT_GAP_MM);
+}
+
+// Puts the axle on the decision point before an arc: the front wall if there is one,
 // otherwise the encoders.
 void settleAtDecisionPoint() {
   sense();
-  if (tofF < WALL_THRESHOLD_MM) {
-    alignToFrontWall();
+  if (tofF < FRONT_WALL_THRESHOLD_MM) {
+    alignToFrontWall(FRONT_GAP_MM);
     carryMm = 0;
   } else if (fabs(carryMm) > 5 && !(atStartWall && carryMm > 0)) {
-    driveStraight(-carryMm, 90, false);
+    driveStraight(-carryMm, 90, false, false, NAN);
     carryMm = 0;
   }
 }
 
 bool executeTurn(char move) {
   if (move == 'S') return true;
-  settleAtDecisionPoint();
   bool ok;
-  if (move == 'R')      ok = swingTurn(-1);
-  else if (move == 'L') ok = swingTurn(+1);
-  else                  ok = uTurn();
-  // Where the axle ended up, measured from the decision point in the new direction.
-  carryMm = (move == 'U') ? 2 * TURN_BACKOFF_MM : HALF_TRACK_MM + TURN_BACKOFF_MM;
+  if (move == 'U') {
+    ok = spinSafely(180.0f);
+    // The U-turn happens U_TURN_FRONT_GAP from the dead-end wall; measure the axle from the
+    // decision point in the new direction.
+    carryMm = (U_TURN_FRONT_GAP_MM + AXLE_TO_FRONT_MM - HALF_CORRIDOR_MM) + DECISION_BACK_MM;
+  } else {
+    int dir = (move == 'L') ? 1 : -1;
+    settleAtDecisionPoint();
+    prepareArc(dir);
+    ok = arcTurn(dir);
+    carryMm = TURN_RADIUS_MM + DECISION_BACK_MM;  // arc ends TURN_RADIUS past the cell centre
+  }
   return ok;
 }
 
 // Drives to the decision point numCells ahead.
 bool moveCells(int numCells, int maxPwm) {
   Serial.print(F("Forward cells: ")); Serial.println(numCells);
-  int r = driveStraight(numCells * CELL_MM - carryMm, maxPwm, true);
+  float startAxle = carryMm - DECISION_BACK_MM;
+  int r = driveStraight(numCells * CELL_MM - carryMm, maxPwm, true, true, startAxle);
   carryMm = (r == DRIVE_WALL) ? 0 : lastOvershootMm;
   atStartWall = false;
   return r != DRIVE_STALL;
@@ -504,7 +661,7 @@ void startAlignment() {
   delay(400);
   calibrateGyro();  // heading 0 = straight out of the start cell
   // Back against the wall: axle is AXLE_TO_REAR from the wall face.
-  carryMm = AXLE_TO_REAR_MM + TURN_BACKOFF_MM - HALF_CORRIDOR_MM;
+  carryMm = (AXLE_TO_REAR_MM - HALF_CORRIDOR_MM) + DECISION_BACK_MM;
   atStartWall = true;
   failCount = 0;
 }
@@ -551,21 +708,21 @@ void executePath(const char* p, int len, int maxPwm) {
 }
 
 void printGeometryCheck() {
-  float rf = sqrt(sq(AXLE_TO_FRONT_MM) + sq(HALF_WIDTH_MM));
-  float rr = sqrt(sq(AXLE_TO_REAR_MM) + sq(HALF_WIDTH_MM));
-  float reach = HALF_TRACK_MM + HALF_WIDTH_MM;
-  float swingSide  = HALF_CORRIDOR_MM - (sqrt(sq(reach) + sq(AXLE_TO_REAR_MM)) - HALF_TRACK_MM);
-  float swingFront = HALF_CORRIDOR_MM - (sqrt(sq(reach) + sq(AXLE_TO_FRONT_MM)) - TURN_BACKOFF_MM);
-  float spinSide   = HALF_CORRIDOR_MM - max(rf, rr);
+  float arcOuter = HALF_CORRIDOR_MM - ARC_OUTER_REACH_MM;
+  float arcFront = HALF_CORRIDOR_MM - (sqrt(sq(TURN_RADIUS_MM + HALF_WIDTH_MM) + sq(AXLE_TO_FRONT_MM)) - DECISION_BACK_MM);
+  float uTurnSide = (2 * HALF_CORRIDOR_MM - SPIN_R_REAR_MM - SPIN_R_FRONT_MM) / 2;
 
   Serial.println(F("\n--- GEOMETRY CHECK ---"));
-  Serial.print(F("Centred side reading should be: ")); Serial.println(SIDE_GAP_MM);
-  Serial.print(F("Front reading at decision point: ")); Serial.println(FRONT_GAP_MM);
-  Serial.print(F("Swing turn clearance, outer wall: ")); Serial.println(swingSide);
-  Serial.print(F("Swing turn clearance, front wall: ")); Serial.println(swingFront);
-  Serial.print(F("U-turn clearance per side:        ")); Serial.println(spinSide);
-  if (swingSide < 5 || swingFront < 5) Serial.println(F("WARNING: swing turns are tight - check AXLE_TO_FRONT_MM / TRACK_WIDTH_MM"));
-  if (spinSide < 2) Serial.println(F("WARNING: U-turns will scrape - axle is far from the middle of the body"));
+  Serial.print(F("Side reading when centred:        ")); Serial.println(SIDE_GAP_MM);
+  Serial.print(F("Front reading, axle at centre:    ")); Serial.println(HALF_CORRIDOR_MM - AXLE_TO_FRONT_MM);
+  Serial.print(F("Front reading at decision point:  ")); Serial.println(FRONT_GAP_MM);
+  Serial.print(F("Front reading for U-turns:        ")); Serial.println(U_TURN_FRONT_GAP_MM);
+  Serial.print(F("Arc turn clearance, outer wall:   ")); Serial.println(arcOuter);
+  Serial.print(F("Arc turn clearance, front wall:   ")); Serial.println(arcFront);
+  Serial.print(F("U-turn clearance per side:        ")); Serial.println(uTurnSide);
+  Serial.print(F("Arc inner/outer wheel ratio:      ")); Serial.println(ARC_RATIO);
+  if (arcOuter < 6 || arcFront < 6) Serial.println(F("WARNING: arc turns are tight - raise TURN_RADIUS_MM"));
+  if (uTurnSide < 2) Serial.println(F("WARNING: U-turns cannot clear the walls - shorten the rear overhang"));
 }
 
 // --- SETUP ---
@@ -624,7 +781,7 @@ void loop() {
   // STATE 1: explore (right-hand rule) until START is pressed
   if (runState == 1) {
     senseFor(60);  // fresh readings at the decision point
-    bool wallFront = (tofF < WALL_THRESHOLD_MM);
+    bool wallFront = (tofF < FRONT_WALL_THRESHOLD_MM);
     bool wallLeft  = (tofL < WALL_THRESHOLD_MM);
     bool wallRight = (tofR < WALL_THRESHOLD_MM);
 
@@ -666,13 +823,11 @@ void loop() {
       executePath(returnPath, n, DRIVE_PWM);
       if (runState == 0) return;
 
-      // In the start cell: face heading 0 again (start cell has walls, so spin, centred).
-      settleAtDecisionPoint();
+      // In the start cell: face heading 0 again, then back into the start wall.
       float d = fmod(-targetHeading, 360.0f);
       if (d > 180) d -= 360;
       if (d < -180) d += 360;
-      if (fabs(d) > 135) uTurn();
-      else if (fabs(d) > 45) spinTurn(d);
+      if (fabs(d) > 45) spinSafely(fabs(d) > 135 ? 180.0f : d);
     }
 
     Serial.println(F("\nArrived Home! Press START for the speed run."));
