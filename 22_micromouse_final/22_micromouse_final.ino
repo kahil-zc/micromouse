@@ -325,6 +325,10 @@ const int8_t DX[4] = { 0, 1, 0, -1 };
 const int8_t DY[4] = { 1, 0, -1, 0 };
 
 uint8_t maze[MAZE_W][MAZE_H];  // bits 0-3: wall N,E,S,W   bits 4-7: that wall has been seen
+// Per wall, same order as maze[][]. Bits 4-7 "settled": driven through (or failed twice), so no
+// reading may change it. Bits 0-3 "check": reopened by recoverRoute(); a standing reading may
+// not close it again, only a failed approach to the turn (approachTurn) can.
+uint8_t fixedW[MAZE_W][MAZE_H];
 uint8_t cost[MAZE_W][MAZE_H][4];  // flood cost to the targets from (x, y) facing h; 255 = no way
 int8_t posX = 0, posY = 0;
 uint8_t facing = 0;
@@ -378,6 +382,15 @@ void putWall(int8_t x, int8_t y, uint8_t d, bool present) {
   if (present) maze[nx][ny] |= 1 << o; else maze[nx][ny] &= ~(1 << o);
 }
 
+// Sets (bits 0x10) or clears the "check" mark (bits 0x01) of one wall, on both cells.
+__attribute__((noinline)) void markWall(int8_t x, int8_t y, uint8_t d, uint8_t bit, bool on) {
+  int8_t nx = x + DX[d], ny = y + DY[d];
+  if (on) fixedW[x][y] |= bit << d; else fixedW[x][y] &= ~(bit << d);
+  if (!inMaze(nx, ny)) return;
+  uint8_t o = (d + 2) & 3;
+  if (on) fixedW[nx][ny] |= bit << o; else fixedW[nx][ny] &= ~(bit << o);
+}
+
 // Once the robot knows which way round the maze is and which corner it started in, the real
 // outer walls on the far sides are known too: put them in the map.
 void addOuterWalls() {
@@ -403,6 +416,7 @@ void noteShape(int8_t x, int8_t y) {
 
 void initMaze() {
   memset(maze, 0, sizeof(maze));
+  memset(fixedW, 0, sizeof(fixedW));
   for (int8_t x = 0; x < MAZE_W; x++) {
     putWall(x, 0, 2, true);
     putWall(x, MAZE_H - 1, 0, true);
@@ -627,7 +641,10 @@ void recordWalls(uint8_t walls, uint8_t sure) {
   for (uint8_t i = 0; i < 3; i++) {
     uint8_t d = (facing + 3 + i) & 3;
     bool w = walls & (1 << i);
+    uint8_t fx = fixedW[posX][posY];
+    if (w && i != 1 && (fx & (1 << d))) continue;  // reopened side wall: let approachTurn check it
     if (!(maze[posX][posY] & (0x10 << d))) putWall(posX, posY, d, w);
+    else if (fx & (0x10 << d)) continue;            // driven through: a reading can't close it
     else if ((sure & (1 << i)) && w != (bool)(maze[posX][posY] & (1 << d)) && corrections < MAX_CORRECTIONS) {
       putWall(posX, posY, d, w);
       corrections++;
@@ -650,6 +667,7 @@ void recordCorridor(uint8_t cellsOpen) {
 void advance(uint8_t d, uint8_t n) {
   for (uint8_t i = 0; i < n; i++) {
     putWall(posX, posY, d, false);
+    markWall(posX, posY, d, 0x10, true);  // driven through: settled
     posX += DX[d]; posY += DY[d];
   }
   if (posX > 0 && startX == 0 && !cornerKnown) { cornerKnown = true; addOuterWalls(); }
@@ -676,6 +694,8 @@ void recoverRoute() {
           uint8_t o = (d + 2) & 3;
           maze[x][y] &= ~((1 << d) | (0x10 << d));
           maze[nx][ny] &= ~((1 << o) | (0x10 << o));
+          markWall(x, y, d, 0x10, false);
+          markWall(x, y, d, 0x01, true);  // only driving there may close it again
           any = true;
         }
       }
@@ -1376,7 +1396,7 @@ uint8_t readWalls(float &l, float &f, float &r) {
 __attribute__((noinline)) bool sureSide(float v) { return v < SIDE_SURE_WALL_MM || v > SIDE_SURE_OPEN_MM; }
 uint8_t sureWalls(float l, float f, float r) {
   float d = fabs(f - (FRONT_WALL_THRESHOLD_MM - carryMm));
-  return sureSide(l) | ((d > FRONT_SURE_MARGIN_MM && f < 999) << 1) | (sureSide(r) << 2);
+  return sureSide(l) | ((d > FRONT_SURE_MARGIN_MM) << 1) | (sureSide(r) << 2);
 }
 
 // Reads the three walls of the current cell from its decision point, at every stop, and puts
@@ -1569,7 +1589,7 @@ void blink(uint8_t times) {
 // twice from the same cell means it really is blocked: then (only then) a wall goes in the map.
 uint8_t undoMaze[MAZE_W][MAZE_H];
 int8_t undoX, undoY, undoStartX;
-uint8_t undoFacing, undoLongSide, undoPhase;
+uint8_t undoFacing, undoLongSide, undoPhase, undoCorrections, undoReopens;
 bool undoCorner;
 uint8_t tryDir = 255;               // the move being tried from the last good stop (255 = none yet)
 int8_t failX = -1, failY = -1;      // the move that went wrong last time
@@ -1579,22 +1599,27 @@ void rememberStop() {
   memcpy(undoMaze, maze, sizeof(maze));
   undoX = posX; undoY = posY; undoStartX = startX;
   undoFacing = facing; undoLongSide = longSide; undoPhase = phase; undoCorner = cornerKnown;
+  undoCorrections = corrections; undoReopens = reopens;
   tryDir = 255;
 }
 
+// blame: the move itself went wrong (a one-cell drive stalled or crashed), so it counts toward
+// "failed twice = wall". A button press, a failed turn or a long straight doesn't: the wall
+// could be anywhere, or nowhere.
 // Returns true to carry on with the run, false if it was ended.
-bool pauseAndRedo() {
+bool pauseAndRedo(bool blame) {
   stopMotors();
   while (digitalRead(START_BUTTON) == LOW);  // let go of the button first
   delay(50);
   memcpy(maze, undoMaze, sizeof(maze));
   posX = undoX; posY = undoY; startX = undoStartX;
   facing = undoFacing; longSide = undoLongSide; phase = undoPhase; cornerKnown = undoCorner;
-  if (tryDir != 255) {
+  corrections = undoCorrections; reopens = undoReopens;
+  if (blame && tryDir != 255) {
     if (failX == posX && failY == posY && failDir == tryDir) {
       putWall(posX, posY, tryDir, true);  // went wrong twice: it really is blocked
+      markWall(posX, posY, tryDir, 0x10, true);
       failX = -1;
-      Serial.println(F("Failed twice: wall."));
     } else {
       failX = posX; failY = posY; failDir = tryDir;
     }
@@ -1664,7 +1689,7 @@ void finishAtHome() {
 void runStep() {
   rememberStop();
   if (phase != PH_FAST) senseWallsHere();  // the speed run trusts the map and doesn't stop
-  if (pauseRequested) { pauseAndRedo(); return; }
+  if (pauseRequested) { pauseAndRedo(false); return; }
 
   uint8_t oldPhase = phase;
   uint8_t dir = facing;
@@ -1686,7 +1711,12 @@ void runStep() {
     settleAtDecisionPoint();
     sense();
     if (tofF >= FRONT_WALL_THRESHOLD_MM && !approachTurn(move == 'L' ? 1 : -1)) {
-      putWall(posX, posY, dir, true);  // the side ToF sees no opening there: a wall after all
+      // The side ToF sees no opening there: a wall after all. The second time from the same
+      // cell it is settled; the first time a clear-cut reading may still reopen it.
+      putWall(posX, posY, dir, true);
+      markWall(posX, posY, dir, 0x01, false);
+      if (failX == posX && failY == posY && failDir == dir) { markWall(posX, posY, dir, 0x10, true); failX = -1; }
+      else { failX = posX; failY = posY; failDir = dir; }
       saveMaze();
       return;
     }
@@ -1694,11 +1724,11 @@ void runStep() {
   if (move == 'S' && phase != PH_FAST && !atCentre) centreInCorridor(CENTRE_TOL_MM);
   bool turned = executeTurn(move);
   facing = dir;
-  if (!turned || pauseRequested) { pauseAndRedo(); return; }
+  if (!turned || pauseRequested) { pauseAndRedo(false); return; }
 
   uint8_t done = moveCells(n, phase == PH_FAST ? SPEED_RUN_PWM : DRIVE_PWM);
   atCentre = false;
-  if (lastDriveStalled || lastDriveCrashed || pauseRequested) { pauseAndRedo(); return; }
+  if (lastDriveStalled || lastDriveCrashed || pauseRequested) { pauseAndRedo(!pauseRequested && n == 1); return; }
   advance(dir, done);
   if (done < n) putWall(posX, posY, dir, true);  // the front ToF found a wall the map didn't have
   if (failX == undoX && failY == undoY && failDir == dir) failX = -1;  // the redo worked
