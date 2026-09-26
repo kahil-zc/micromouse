@@ -1,7 +1,7 @@
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  16_micromouse_5x10                                              ║
-// ║  Flood-fill micromouse for a maze 10 cells across and 5 cells    ║
-// ║  ahead of the start (18 cm cells).                               ║
+// ║  Flood-fill micromouse for a 5 x 10 maze of 18 cm cells, either  ║
+// ║  way round, started in either corner.                            ║
 // ║  Robot: 99 x 126 mm, axle 47 mm behind the front.                ║
 // ║                                                                  ║
 // ║  Button (START), robot in the start cell, back to the wall:      ║
@@ -18,10 +18,11 @@
 // ║  four cells meet around a post with no wall touching it. The     ║
 // ║  robot also works out which corner it started in.                ║
 // ║                                                                  ║
-// ║  Exploring never drives to a cell twice on purpose: cells whose  ║
-// ║  walls are already known (seen from next door or by the front    ║
-// ║  ToF from further back) count as mapped, and it drives straight  ║
-// ║  through mapped cells without stopping.                          ║
+// ║  Exploring drives into every cell and reads its walls there. It  ║
+// ║  always heads for the nearest unmapped cell, skips cells whose   ║
+// ║  four walls it already saw from next door, and drives straight   ║
+// ║  through mapped cells without stopping. Every stop is printed on ║
+// ║  Serial (cell, readings, walls, where it goes next).             ║
 // ║                                                                  ║
 // ║  How the ToFs are used:                                          ║
 // ║   * Sides, every 5 ms: steer toward the corridor centre.         ║
@@ -29,7 +30,6 @@
 // ║     and correct the gyro, so it stays straight in open cells.    ║
 // ║   * Sides: wall start/end edges correct the distance driven.     ║
 // ║   * Sides: closer than 15 mm = steer hard away and slow down.    ║
-// ║   * Front: maps up to two cells ahead from each stop.            ║
 // ║   * Front: checks the corridor before every straight and stops   ║
 // ║     at the right spot; emergency stop under 20 mm.               ║
 // ║                                                                  ║
@@ -68,10 +68,14 @@
 
 // === MAZE ===
 // Cells are (x, y), y = 0 is the start row. The robot starts facing +y ("ahead"); +x is to its
-// right. It assumes it is in the left-hand corner (x = 0) and moves the map over if it finds it
-// is in the right one.
-#define MAZE_W  10   // cells across (side to side at the start)
-#define MAZE_H   5   // cells ahead of the start
+// right. The map is a 10 x 10 box so a 5 x 10 maze fits whichever way round it is: the real
+// outer walls are simply read like any other wall, and cells outside the maze are never reached.
+#define MAZE_W  10   // map cells across: at least the maze's width
+#define MAZE_H  10   // map cells ahead: at least the maze's length
+// Start corner: 0 = work it out (the robot assumes left, and moves the map over the first time it
+// sees an opening to the left of column 0), 1 = left corner (maze is to the robot's right),
+// 2 = right corner (maze is to the robot's left). Setting it removes any chance of a wrong guess.
+#define START_CORNER 0
 
 // === YOUR CALIBRATED TOF BIAS ===
 // reading - bias = gap from that face of the robot to the wall
@@ -470,21 +474,33 @@ uint8_t plan(uint8_t &dir) {
 
 // The robot assumed the left-hand corner but has just seen an opening to the left of column 0,
 // so it started in the right-hand corner: everything seen so far is really column MAZE_W - 1.
+// Cells it already stood in keep all four walls (so it never goes back to look at them again);
+// other cells keep only what was really seen of them.
 void shiftToRightCorner() {
   uint8_t col[MAZE_H];
   for (int y = 0; y < MAZE_H; y++) col[y] = maze[0][y];
   initMaze();
-  for (int y = 0; y < MAZE_H; y++)
-    for (uint8_t d = 0; d <= 2; d += 2)
-      if (col[y] & (0x10 << d)) putWall(MAZE_W - 1, y, d, col[y] & (1 << d), false);
+  for (int y = 0; y < MAZE_H; y++) {
+    bool wasVisited = (col[y] & 0xF0) == 0xF0;
+    for (uint8_t d = 0; d < 4; d++) {
+      if (!(col[y] & (0x10 << d))) continue;
+      if (!wasVisited && d == 3) continue;  // the assumed left border was never really seen
+      putWall(MAZE_W - 1, y, d, col[y] & (1 << d), false);
+    }
+  }
   posX += MAZE_W - 1;
   startX = MAZE_W - 1;
   cornerKnown = true;
 }
 
-// Records what the ToFs see from the decision point. aheadWall = k (1 or 2) when the front ToF
-// sees the far wall of the k-th cell ahead; aheadOpen = it sees past the first cell ahead.
-void recordWalls(bool wallL, bool wallF, bool wallR, uint8_t aheadWall, bool aheadOpen) {
+// Called at the start of each run from the start cell.
+void resetStart() {
+  if (START_CORNER == 1) { startX = 0; cornerKnown = true; }
+  if (START_CORNER == 2) { startX = MAZE_W - 1; cornerKnown = true; }
+}
+
+// Records the three walls the ToFs see from this cell's decision point.
+void recordWalls(bool wallL, bool wallF, bool wallR) {
   uint8_t left = (facing + 3) & 3, right = (facing + 1) & 3;
   if (!cornerKnown && posX == 0) {
     bool westOpen = (facing == 3 && !wallF) || (right == 3 && !wallR) || (left == 3 && !wallL);
@@ -493,15 +509,6 @@ void recordWalls(bool wallL, bool wallF, bool wallR, uint8_t aheadWall, bool ahe
   putWall(posX, posY, facing, wallF, false);
   putWall(posX, posY, right, wallR, false);
   putWall(posX, posY, left, wallL, false);
-  if (wallF) return;
-  int x1 = posX + DX[facing], y1 = posY + DY[facing];
-  if (!inMaze(x1, y1)) return;
-  if (aheadWall == 1) putWall(x1, y1, facing, true, true);
-  else if (aheadOpen) {
-    putWall(x1, y1, facing, false, true);
-    int x2 = x1 + DX[facing], y2 = y1 + DY[facing];
-    if (aheadWall == 2 && inMaze(x2, y2)) putWall(x2, y2, facing, true, true);
-  }
 }
 
 // The robot drove n cells along d: those walls are open.
@@ -1125,31 +1132,31 @@ void startAlignment() {
 }
 
 // --- MAP: WALL SENSING, SAVING, PRINTING ---
-// Reads the walls of the current cell from its decision point, and with the front ToF up to
-// two cells further along an open corridor.
+// Reads the three walls of the current cell from its decision point and prints them.
+// The front threshold allows for the robot not being exactly on the decision point.
 void senseWallsHere() {
   float l, f, r;
   averageAll(l, f, r);
-  bool wallF = f < FRONT_WALL_THRESHOLD_MM;
-  uint8_t aheadWall = 0;
-  bool aheadOpen = false;
-  if (!wallF) {
-    for (uint8_t k = 1; k <= 2; k++) {
-      float gap = FRONT_GAP_MM + CELL_MM * k - carryMm;  // reading if the k-th cell ahead has a far wall
-      if (f < gap + 35) { if (f > gap - 35) aheadWall = k; break; }
-      if (k == 1 && f > gap + 70) aheadOpen = true;
-    }
-  }
+  bool wallL = l < WALL_THRESHOLD_MM;
+  bool wallF = f < FRONT_WALL_THRESHOLD_MM - carryMm;
+  bool wallR = r < WALL_THRESHOLD_MM;
   bool shifted = !cornerKnown;
-  recordWalls(l < WALL_THRESHOLD_MM, wallF, r < WALL_THRESHOLD_MM, aheadWall, aheadOpen);
+  recordWalls(wallL, wallF, wallR);
   if (shifted && startX != 0) Serial.println(F("Started in the RIGHT-hand corner - map moved over"));
+  static const char dirName[4] = { 'N', 'E', 'S', 'W' };
+  Serial.print(F("Cell (")); Serial.print(posX); Serial.print(','); Serial.print(posY);
+  Serial.print(F(") facing ")); Serial.print(dirName[facing]);
+  Serial.print(F("  L ")); Serial.print((int)l); Serial.print(F(" F ")); Serial.print((int)f);
+  Serial.print(F(" R ")); Serial.print((int)r);
+  Serial.print(F("  walls: ")); Serial.print(wallL ? 'L' : '-'); Serial.print(wallF ? 'F' : '-');
+  Serial.println(wallR ? 'R' : '-');
 }
 
 // Before driving n cells: the front ToF must not see a wall the map says isn't there.
 // Records any such wall and returns how many cells are really clear.
 uint8_t checkAhead(uint8_t n) {
   senseFor(40);
-  for (uint8_t k = 0; k < n && k < 3; k++) {
+  for (uint8_t k = 0; k < n && k < 2; k++) {  // further than one cell the beam clips the posts
     float gap = FRONT_GAP_MM + CELL_MM * k - carryMm;  // reading if the far wall of cell k is there
     if (gap < 30) continue;                            // that wall line is already behind the nose
     if (tofF < gap + 25) {
@@ -1217,7 +1224,7 @@ void printMaze() {
 void reportPath() {
   int mapped = 0;
   for (int x = 0; x < MAZE_W; x++) for (int y = 0; y < MAZE_H; y++) if (visited(x, y)) mapped++;
-  Serial.print(F("Cells mapped: ")); Serial.print(mapped); Serial.print('/'); Serial.println(MAZE_W * MAZE_H);
+  Serial.print(F("Cells mapped: ")); Serial.println(mapped);
   if (!goalKnown) { Serial.println(F("No 2x2 goal room found.")); return; }
   Serial.print(F("Goal room at (")); Serial.print(goalX); Serial.print(','); Serial.print(goalY);
   Serial.print(F(")  speed-run path: "));
@@ -1250,6 +1257,7 @@ void blink(uint8_t times) {
 void beginRun(uint8_t firstPhase) {
   delay(500);  // let go of the robot
   startAlignment();
+  resetStart();
   posX = startX; posY = 0; facing = 0;
   putWall(startX, 0, 2, true, false);
   abortExploration = false;
@@ -1307,11 +1315,18 @@ void runStep() {
     // A misread wall has closed every route. Start the map again and keep going.
     Serial.println(F("No route - a wall was misread. Clearing the map."));
     initMaze();
+    resetStart();
     putWall(startX, 0, 2, true, false);
     return;
   }
   if (phase != oldPhase) { announcePhase(oldPhase); return; }
   if (n == 0) return;
+  Serial.print(F("  -> ")); Serial.print(relMove(facing, dir));
+  Serial.print(F(", drive ")); Serial.print(n);
+  if (phase == PH_EXPLORE) {
+    Serial.print(F(" toward unmapped cell (")); Serial.print(exploreX); Serial.print(','); Serial.print(exploreY); Serial.print(')');
+  }
+  Serial.println();
 
   noteResult(executeTurn(relMove(facing, dir)));
   facing = dir;
@@ -1372,6 +1387,7 @@ void setup() {
   if (digitalRead(START_BUTTON) == LOW) {
     initMaze();
     startX = 0; cornerKnown = false;
+    resetStart();
     saveMaze();
     Serial.println(F("\nMap cleared."));
     while (digitalRead(START_BUTTON) == LOW);
@@ -1384,6 +1400,7 @@ void setup() {
   } else {
     initMaze();
     startX = 0; cornerKnown = false;
+    resetStart();
   }
 
   Serial.println(F("\n=== FLOOD FILL MICROMOUSE ==="));
