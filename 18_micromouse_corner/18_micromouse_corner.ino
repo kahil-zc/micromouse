@@ -533,6 +533,7 @@ void advance(uint8_t d, uint8_t n) {
   }
   if (posX > 0 && startX == 0) cornerKnown = true;
 }
+
 // Misread walls have shut the robot off from its target. Forgets every wall between the cells
 // the robot can reach and the cells it can't (except the one behind it, which it can't read
 // from here), so it drives back and reads them again. If that keeps happening, the map starts
@@ -567,6 +568,7 @@ void recoverRoute() {
   putWall(startX, 0, 2, true);
   if (phase == PH_IMPROVE) phase = PH_SEARCH;
 }
+
 // --- END MAZE ---
 
 // --- INTERRUPT SERVICE ROUTINES ---
