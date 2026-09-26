@@ -1389,6 +1389,7 @@ bool loadMaze() {
   longSide = EEPROM.read(addr++);
   if (EEPROM.read(addr) == 1) {
     Serial.println(F("\n!!! Restarted while driving (switched off, battery dip, or Serial Monitor opened). Map kept."));
+    EEPROM.update(addr, 0);  // reported once
   }
   return (startX == 0 || startX == MAZE_W - 1) && longSide <= 2;
 }
