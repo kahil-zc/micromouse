@@ -92,12 +92,22 @@
 // way round the maze is). The goal is the corner diagonally opposite the start.
 #define MAZE_SHORT   5   // cells on the short side of the maze
 #define MAZE_LONG   10   // cells on the long side
-#define MAZE_W      MAZE_LONG   // map size: fits the maze either way round
-#define MAZE_H      MAZE_LONG
 #define GOAL_SIZE    2   // the goal room: 2 = 2x2 cells in the far corner (1 = just the corner cell)
 // Which way round: 1 = long side across (10 across, 5 ahead), 2 = long side ahead (5 across,
 // 10 ahead), 0 = let the robot work it out.
 #define LONG_SIDE    1
+// Map size. With the shape set, the map is exactly the maze, so its edges ARE the outer walls
+// and can never be opened by a bad reading. Otherwise a 10 x 10 box that fits either way round.
+#if LONG_SIDE == 1
+#define MAZE_W MAZE_LONG
+#define MAZE_H MAZE_SHORT
+#elif LONG_SIDE == 2
+#define MAZE_W MAZE_SHORT
+#define MAZE_H MAZE_LONG
+#else
+#define MAZE_W MAZE_LONG
+#define MAZE_H MAZE_LONG
+#endif
 // Start corner: 1 = left corner (maze is to the robot's right), 2 = right corner, 0 = let the
 // robot work it out (it assumes left and moves the map over if it sees an opening on the left).
 #define START_CORNER 1
@@ -319,6 +329,15 @@ int8_t tgX[MAX_TARGETS], tgY[MAX_TARGETS];
 uint8_t tgN = 0;
 
 bool inMaze(int8_t x, int8_t y) { return x >= 0 && y >= 0 && x < MAZE_W && y < MAZE_H; }
+
+// True if (x, y) is not part of the real maze: off the map, or (once the shape and start corner
+// are known) beyond its outer walls. The outer walls then can never be opened, whatever is read.
+bool outside(int8_t x, int8_t y) {
+  if (!inMaze(x, y)) return true;
+  if (!cornerKnown || longSide == 0) return false;
+  int8_t a = (startX == 0) ? x : startX - x;
+  return a < 0 || a >= (longSide == 1 ? MAZE_LONG : MAZE_SHORT) || y >= (longSide == 1 ? MAZE_SHORT : MAZE_LONG);
+}
 bool isStart(int8_t x, int8_t y) { return x == startX && y == 0; }
 bool visited(int8_t x, int8_t y) { return (maze[x][y] & 0xF0) == 0xF0; }  // all four walls seen
 
@@ -339,7 +358,7 @@ bool isGoal(int8_t x, int8_t y) {
 void putWall(int8_t x, int8_t y, uint8_t d, bool present) {
   if (!inMaze(x, y)) return;  // never write outside the map
   int8_t nx = x + DX[d], ny = y + DY[d];
-  if (!inMaze(nx, ny)) present = true;
+  if (outside(nx, ny)) present = true;
   uint8_t o = (d + 2) & 3;
   maze[x][y] |= 0x10 << d;
   if (present) maze[x][y] |= 1 << d; else maze[x][y] &= ~(1 << d);
@@ -390,7 +409,7 @@ bool blocked(int8_t x, int8_t y, uint8_t d, bool pessimistic) {
   uint8_t c = maze[x][y];
   if (c & (1 << d)) return true;
   int8_t nx = x + DX[d], ny = y + DY[d];
-  if (!inMaze(nx, ny)) return true;  // the edge of the map, even if a saved map says otherwise
+  if (outside(nx, ny)) return true;  // an outer wall, even if a saved map says otherwise
   if (maze[nx][ny] & (1 << ((d + 2) & 3))) return true;
   return pessimistic && !(c & (0x10 << d));
 }
@@ -641,7 +660,7 @@ void recoverRoute() {
         if (cellCost(x, y) == 255) continue;
         for (uint8_t d = 0; d < 4; d++) {
           int8_t nx = x + DX[d], ny = y + DY[d];
-          if (!inMaze(nx, ny) || cellCost(nx, ny) != 255 || !(maze[x][y] & (1 << d))) continue;
+          if (outside(nx, ny) || cellCost(nx, ny) != 255 || !(maze[x][y] & (1 << d))) continue;
           if (x == posX && y == posY && d == ((facing + 2) & 3)) continue;
           uint8_t o = (d + 2) & 3;
           maze[x][y] &= ~((1 << d) | (0x10 << d));
@@ -1300,7 +1319,7 @@ uint8_t readWalls(float &l, float &f, float &r) {
 uint8_t sureWalls(float l, float f, float r) {
   float frontLimit = FRONT_WALL_THRESHOLD_MM - carryMm;
   return (l < SIDE_SURE_WALL_MM || l > SIDE_SURE_OPEN_MM)
-       | ((f < frontLimit - FRONT_SURE_MARGIN_MM || f > frontLimit + FRONT_SURE_MARGIN_MM) << 1)
+       | ((f < frontLimit - FRONT_SURE_MARGIN_MM || (f > frontLimit + FRONT_SURE_MARGIN_MM && f < 999)) << 1)
        | ((r < SIDE_SURE_WALL_MM || r > SIDE_SURE_OPEN_MM) << 2);
 }
 
@@ -1343,6 +1362,7 @@ void saveMaze() {
   EEPROM.update(addr++, startX);
   EEPROM.update(addr++, cornerKnown);
   EEPROM.update(addr++, longSide);
+  EEPROM.update(addr++, runState == ST_RUN);
 }
 
 bool loadMaze() {
@@ -1353,66 +1373,93 @@ bool loadMaze() {
   startX = EEPROM.read(addr++);
   cornerKnown = EEPROM.read(addr++);
   longSide = EEPROM.read(addr++);
+  if (EEPROM.read(addr) == 1) {
+    Serial.println(F("\n!!! RESET during a run: battery dip? Map kept."));
+  }
   return (startX == 0 || startX == MAZE_W - 1) && longSide <= 2;
 }
 
 bool speedRunReady() { return knownPathLength() != 255; }
+
+// --- RAM CHECK ---
+// At power-on the free RAM between the variables and the stack is filled with a pattern. Later,
+// the bytes the stack never reached still hold it: that is the RAM that was never needed.
+// If this gets near 0 the stack has run into the variables and the robot will misbehave.
+extern char __bss_end;
+void paintRam() {
+  char here;
+  for (char *p = &__bss_end; p < &here - 40; p++) *p = 0x5A;
+}
+uint16_t ramNeverUsed() {
+  char *p = &__bss_end;
+  while (*p == 0x5A) p++;
+  return p - &__bss_end;
+}
 
 // --- MAP ON THE COMPUTER (Serial Monitor, 115200 baud) ---
 // Each cell of the map is ONE BYTE:
 //   bit 0..3 = wall to the N, E, S, W   (1 = wall, 0 = open)
 //   bit 4..7 = that wall has been seen (1 = seen by the ToFs, or driven through)
 // N = ahead from the start, E = to the right. Example: 0xF5 = 1111 0101 = all four sides seen,
-// walls N and S, open E and W: a corridor running left-right. 0x31 = N and E seen, wall N,
-// open E, S and W not seen yet. A cell is "mapped" when its top four bits are all 1 (0xF_).
-// A wall is shared by two cells, so it is always written into both of them.
+// walls N and S, open E and W: a corridor running left-right. A cell is fully mapped when its
+// top four bits are all 1 (0xF_). A wall is shared by two cells, so it is written into both.
 //
-// printMap() draws it: +---+ wall seen, +   + open, + . + not seen yet; the same for | ' ' :
-// inside a cell: ^ > v < = the robot, G = goal, * = mapped, blank = not mapped yet.
-// Then the bytes themselves, one row of cells per line, far row first.
+// printMap() draws the map with column and row numbers:
+//   +---+ and |  wall seen      +   + and ' '  seen open      + . + and :  not seen yet
+//   ^ > v <  the robot    G  goal    #  mapped    (blank)  not mapped yet
+// and then one DATA line: width, height, start column, robot x, y, facing (0-3 = N E S W), goal
+// size, and every cell byte in hex (row 0 first, left to right). Paste the Serial Monitor
+// output into the Maze Map Viewer page to draw it.
 void printMap() {
   int8_t w = (longSide == 2) ? MAZE_SHORT : (longSide == 1) ? MAZE_LONG : MAZE_W;
   int8_t h = (longSide == 1) ? MAZE_SHORT : (longSide == 2) ? MAZE_LONG : MAZE_H;
+  if (w > MAZE_W) w = MAZE_W;
+  if (h > MAZE_H) h = MAZE_H;
   int8_t x0 = (startX == 0) ? 0 : startX - w + 1;
   static const char arrow[4] = { '^', '>', 'v', '<' };
   uint8_t mapped = 0;
-  Serial.println(F("\nMAP (far row at the top, start row at the bottom)"));
+  Serial.print(F("\n    "));
+  for (int8_t x = 0; x < w; x++) { Serial.print(' '); Serial.print(x); Serial.print(F("  ")); }
+  Serial.println();
   for (int8_t y = h - 1; y >= 0; y--) {
+    Serial.print(F("    "));
     for (int8_t x = x0; x < x0 + w; x++) {
       uint8_t c = maze[x][y];
       Serial.print('+');
       Serial.print((c & 0x10) ? ((c & 1) ? F("---") : F("   ")) : F(" . "));
     }
     Serial.println('+');
+    Serial.print(' '); Serial.print(y); Serial.print(F("  "));
     for (int8_t x = x0; x < x0 + w; x++) {
       uint8_t c = maze[x][y];
       Serial.print((c & 0x80) ? ((c & 8) ? '|' : ' ') : ':');
       Serial.print(' ');
       if (x == posX && y == posY) Serial.print(arrow[facing]);
       else if (isGoal(x, y)) Serial.print('G');
-      else Serial.print(visited(x, y) ? '*' : ' ');
+      else Serial.print(visited(x, y) ? '#' : ' ');
       Serial.print(' ');
       if (visited(x, y)) mapped++;
     }
     uint8_t c = maze[x0 + w - 1][y];
     Serial.println((c & 0x20) ? ((c & 2) ? '|' : ' ') : ':');
   }
-  for (int8_t x = x0; x < x0 + w; x++) Serial.print(F("+---"));
+  Serial.print(F("    "));
+  for (int8_t x = 0; x < w; x++) Serial.print(F("+---"));
   Serial.println('+');
-  Serial.println(F("Bytes (hex), far row first:"));
-  for (int8_t y = h - 1; y >= 0; y--) {
-    Serial.print(F("y=")); Serial.print(y); Serial.print(F(": "));
+  Serial.print(F("Mapped ")); Serial.print(mapped); Serial.print('/'); Serial.print(w * h);
+  Serial.print(F(" cells. Robot (")); Serial.print(posX - x0); Serial.print(',');
+  Serial.print(posY); Serial.print(F(") facing ")); Serial.print("NESW"[facing]);
+  Serial.print(F(". Speed run ")); Serial.print(speedRunReady() ? F("ready") : F("not yet"));
+  Serial.print(F(". RAM never used: ")); Serial.print(ramNeverUsed()); Serial.println(F(" bytes"));
+  Serial.print(F("DATA:")); Serial.print(w); Serial.print(','); Serial.print(h); Serial.print(',');
+  Serial.print(startX - x0); Serial.print(','); Serial.print(posX - x0); Serial.print(','); Serial.print(posY); Serial.print(','); Serial.print(facing);
+  Serial.print(','); Serial.print(GOAL_SIZE); Serial.print(',');
+  for (int8_t y = 0; y < h; y++)
     for (int8_t x = x0; x < x0 + w; x++) {
       if (maze[x][y] < 0x10) Serial.print('0');
       Serial.print(maze[x][y], HEX);
-      Serial.print(' ');
     }
-    Serial.println();
-  }
-  Serial.print(F("Mapped ")); Serial.print(mapped); Serial.print(F(" of ")); Serial.print(w * h);
-  Serial.print(F(" cells. Robot at (")); Serial.print(posX - x0); Serial.print(',');
-  Serial.print(posY); Serial.print(F(") facing ")); Serial.print("NESW"[facing]);
-  Serial.println(speedRunReady() ? F(". Speed run: ready.") : F(". Speed run: not yet (no route on seen walls)."));
+  Serial.println();
 }
 
 // --- RUN CONTROL ---
@@ -1486,14 +1533,13 @@ bool pauseAndRedo() {
     if (failX == posX && failY == posY && failDir == tryDir) {
       putWall(posX, posY, tryDir, true);  // went wrong twice: it really is blocked
       failX = -1;
-      Serial.println(F("Same move failed twice: marked as a wall."));
+      Serial.println(F("Failed twice: wall."));
     } else {
       failX = posX; failY = posY; failDir = tryDir;
     }
   }
   saveMaze();
-  Serial.println(F("\nPAUSED. Put the robot in the middle of the cell marked with the arrow,"));
-  Serial.println(F("facing the arrow, then press. Long press = end the run."));
+  Serial.println(F("\nPAUSED: put it in the arrow's cell, facing the arrow, press. Long = end."));
   printMap();
   blink(2);
   digitalWrite(STATUS_LED, HIGH);
@@ -1503,6 +1549,7 @@ bool pauseAndRedo() {
   if (b != 1) {  // long press or double click: end the run, keep the map
     phase = PH_DONE;
     runState = ST_WAIT;
+    saveMaze();
     return false;
   }
   delay(500);  // let go of the robot
@@ -1530,6 +1577,7 @@ void beginRun(uint8_t firstPhase) {
   failX = -1;
   phase = firstPhase;
   runState = ST_RUN;
+  saveMaze();  // marks "run going" in EEPROM, so a reset mid-run is reported at power-on
 }
 
 // In the start cell: face ahead again and square up on the start wall.
@@ -1540,8 +1588,8 @@ void finishAtHome() {
   else if (m == 'L') spinSafely(90.0f);
   facing = 0;
   startAlignment();
-  saveMaze();
   runState = ST_WAIT;
+  saveMaze();
   Serial.println(F("\nHOME."));
   printMap();
 }
@@ -1592,6 +1640,7 @@ void runStep() {
 
 // --- SETUP ---
 void setup() {
+  paintRam();
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000);
@@ -1622,7 +1671,7 @@ void setup() {
   } else {
     clearMap();  // nothing saved yet
   }
-  Serial.println(F("\nMICROMOUSE 21. Send 'm' to print the map."));
+  Serial.println(F("\nMICROMOUSE 21 ('m' = map)"));
   printMap();
 }
 
