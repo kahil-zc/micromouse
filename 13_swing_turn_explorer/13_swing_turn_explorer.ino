@@ -166,6 +166,14 @@ VL53L0X sensorLeft;
 VL53L0X sensorFront;
 VL53L0X sensorRight;
 
+// Tracks one side sensor switching between wall and gap (see edgeUpdate). Defined up here
+// because the Arduino IDE puts its generated function prototypes above the first function.
+struct SideEdge {
+  bool known, wall, pending;
+  float since, pendingAt;
+  uint8_t pendingCount;
+};
+
 // --- INTERRUPT SERVICE ROUTINES ---
 void leftEncoderISR() {
   if (digitalRead(ENCODER_LEFT_C2) == HIGH) encoderLeftTicks++; else encoderLeftTicks--;
@@ -353,12 +361,6 @@ float headingCorrection(bool useWalls) {
 // --- SIDE-WALL EDGE CORRECTION ---
 // Posts sit on every cell boundary. When a side reading changes between wall and gap, the side
 // sensor is at a known spot (a post edge), which fixes the distance driven so far.
-struct SideEdge {
-  bool known, wall, pending;
-  float since, pendingAt;
-  uint8_t pendingCount;
-};
-
 void resetEdge(SideEdge &e) { e.known = false; e.pending = false; }
 
 // corrMm: running correction added to the encoder distance. startAxleMm: axle position at the
