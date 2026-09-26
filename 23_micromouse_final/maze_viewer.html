@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maze Map Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground: #eef1ec;
+    --panel: #f8faf6;
+    --ink: #1b232c;
+    --muted: #5d6873;
+    --line: #cfd6cf;
+    --wall: #1b232c;
+    --unseen: #a3aeb8;
+    --floor: #f8faf6;
+    --mapped: #dfe9dc;
+    --goal: #e9b949;
+    --goal-ink: #6b4b00;
+    --robot: #d2452e;
+    --path: #2f6fdb;
+    --focus: #2f6fdb;
+    --font-ui: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground: #12171c;
+      --panel: #1a2128;
+      --ink: #e4e9ee;
+      --muted: #97a3ae;
+      --line: #2c3640;
+      --wall: #e4e9ee;
+      --unseen: #55616c;
+      --floor: #1a2128;
+      --mapped: #243528;
+      --goal: #d9a93a;
+      --goal-ink: #1b1400;
+      --robot: #ff6a4d;
+      --path: #6ea1ff;
+      --focus: #6ea1ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #12171c;
+    --panel: #1a2128;
+    --ink: #e4e9ee;
+    --muted: #97a3ae;
+    --line: #2c3640;
+    --wall: #e4e9ee;
+    --unseen: #55616c;
+    --floor: #1a2128;
+    --mapped: #243528;
+    --goal: #d9a93a;
+    --goal-ink: #1b1400;
+    --robot: #ff6a4d;
+    --path: #6ea1ff;
+    --focus: #6ea1ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .wrap {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding-inline: 20px;
+    padding-block: 28px 48px;
+    display: grid;
+    gap: 22px;
+  }
+  header { display: grid; gap: 4px; }
+  h1 {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .sub { color: var(--muted); margin: 0; max-width: 65ch; }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 22px;
+    align-items: start;
+  }
+  @media (max-width: 820px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  .board {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px;
+    display: grid;
+    gap: 14px;
+  }
+  .stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 22px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats b { font-weight: 600; }
+  .stats span { color: var(--muted); }
+  .svgbox { overflow-x: auto; }
+  svg { display: block; width: 100%; height: auto; min-width: 460px; }
+  .timeline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .timeline label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .timeline input[type=range] { flex: 1 1 200px; accent-color: var(--path); }
+  .timeline output { font-family: var(--font-mono); font-size: 13px; min-width: 7ch; }
+  aside { display: grid; gap: 18px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+    display: grid;
+    gap: 10px;
+  }
+  .card h2 {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .byte {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    display: grid;
+    gap: 6px;
+  }
+  .byte .hex { font-size: 26px; font-weight: 600; }
+  .bits { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; text-align: center; }
+  .bits div { border: 1px solid var(--line); border-radius: 4px; padding: 3px 0; }
+  .bits .on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  .bits small { display: block; font-size: 10px; color: var(--muted); }
+  .bits .on small { color: var(--panel); opacity: 0.75; }
+  .sides { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .sides dt { font-weight: 600; }
+  .sides dd { margin: 0; color: var(--muted); }
+  .legend { display: grid; gap: 8px; font-size: 13px; }
+  .legend div { display: flex; align-items: center; gap: 10px; }
+  .legend svg { width: 34px; min-width: 34px; height: 18px; flex: none; }
+  textarea {
+    width: 100%;
+    min-height: 130px;
+    resize: vertical;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--ground);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+  }
+  textarea:focus-visible, input:focus-visible, button:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 7px;
+    border: 1px solid var(--ink);
+    background: var(--ink);
+    color: var(--panel);
+    cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  .msg { font-size: 13px; color: var(--muted); margin: 0; }
+  .msg.err { color: var(--robot); }
+  .hint { font-size: 13px; color: var(--muted); margin: 0; }
+  code { font-family: var(--font-mono); font-size: 0.92em; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1>Maze Map Viewer</h1>
+    <p class="sub">Paste what the robot printed in the Serial Monitor. Every <code>DATA:</code> line is one snapshot of its map; the slider steps through them in order.</p>
+  </header>
+
+  <div class="layout">
+    <section class="board" aria-label="Maze map">
+      <div class="stats" id="stats"></div>
+      <div class="svgbox"><svg id="maze" role="img" aria-label="Map of the maze"></svg></div>
+      <div class="timeline">
+        <label for="snap">Snapshot</label>
+        <input type="range" id="snap" min="0" max="0" value="0">
+        <output id="snapOut" for="snap">1 / 1</output>
+      </div>
+      <p class="hint">Hover or tap a cell to see its byte.</p>
+    </section>
+
+    <aside>
+      <div class="card">
+        <h2>Cell byte</h2>
+        <div class="byte" id="byte"></div>
+      </div>
+      <div class="card">
+        <h2>Key</h2>
+        <div class="legend">
+          <div><svg viewBox="0 0 34 18"><line x1="2" y1="9" x2="32" y2="9" stroke="var(--wall)" stroke-width="4" stroke-linecap="round"/></svg>Wall, seen</div>
+          <div><svg viewBox="0 0 34 18"><line x1="2" y1="9" x2="32" y2="9" stroke="var(--unseen)" stroke-width="2" stroke-dasharray="3 4"/></svg>Not seen yet</div>
+          <div><svg viewBox="0 0 34 18"><rect x="2" y="2" width="30" height="14" rx="2" fill="var(--mapped)"/></svg>Cell fully mapped</div>
+          <div><svg viewBox="0 0 34 18"><rect x="2" y="2" width="30" height="14" rx="2" fill="var(--goal)"/></svg>Goal room</div>
+          <div><svg viewBox="0 0 34 18"><path d="M3 9 H31" stroke="var(--path)" stroke-width="3" fill="none" stroke-linecap="round"/></svg>Speed-run route (seen walls only)</div>
+          <div><svg viewBox="0 0 34 18"><path d="M11 15 L17 3 L23 15 Z" fill="var(--robot)"/></svg>Robot, pointing where it faces</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Paste Serial Monitor output</h2>
+        <textarea id="log" spellcheck="false" aria-label="Serial Monitor output"></textarea>
+        <div class="row">
+          <button type="button" id="draw">Draw</button>
+          <button type="button" class="ghost" id="sample">Load example</button>
+        </div>
+        <p class="msg" id="msg"></p>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+const SAMPLE = `MICROMOUSE 21 ('m' = map)   (example: a simulated search, not your robot)
+DATA:10,5,0,2,4,1,2,FECC4444444444444466F8800000000000000022F8800000000000000022FA981000000000000022F9F1F191111111111133
+DATA:10,5,0,8,4,1,2,FECC4444445444444466F8800000005010000022F880001131F0F2990022FA9832FCF4F3F9F69822F9F1F1F3D95575F1F1B3
+DATA:10,5,0,7,0,3,2,FECC4444445466FDF5F6F8800000005032FCF5F2F880001131F0F2F9F6EAFA9832FCF4F3F9F6FAAAF9F1F1F3D95575F1F1B3
+DATA:10,5,0,0,0,2,2,FEFCF6FDF5F4F6FDF5F6F8F3F9F5F6FAFAFCF5F2F8C44477F9F0F2F9F6FAFA9832FCF4F3F9F6FAFAF9F1F1F3F9F5F5F1F1F3`;
+
+const DX = [0, 1, 0, -1], DY = [1, 0, -1, 0];
+const SIDE = ["N", "E", "S", "W"];
+const SIDE_NAME = ["North (ahead)", "East (right)", "South (back)", "West (left)"];
+let snaps = [];
+let selected = null;
+
+function parse(text) {
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    const i = line.indexOf("DATA:");
+    if (i < 0) continue;
+    const parts = line.slice(i + 5).trim().split(",");
+    if (parts.length < 8) continue;
+    const [w, h, sx, rx, ry, f, g] = parts.slice(0, 7).map(Number);
+    const hex = parts[7].trim();
+    if (!(w > 0 && h > 0) || hex.length < w * h * 2) continue;
+    const cells = [];
+    for (let y = 0; y < h; y++) {
+      cells.push([]);
+      for (let x = 0; x < w; x++) cells[y].push(parseInt(hex.substr((y * w + x) * 2, 2), 16));
+    }
+    out.push({ w, h, sx, rx, ry, f, g, cells });
+  }
+  return out;
+}
+
+function isGoal(s, x, y) {
+  const gx = s.sx === 0 ? s.w - s.g : 0;
+  return x >= gx && x < gx + s.g && y >= s.h - s.g;
+}
+
+// Shortest route from the start to the goal through walls that are seen and open.
+function speedRoute(s) {
+  const dist = s.cells.map(r => r.map(() => -1));
+  const q = [];
+  for (let y = 0; y < s.h; y++) for (let x = 0; x < s.w; x++)
+    if (isGoal(s, x, y)) { dist[y][x] = 0; q.push([x, y]); }
+  for (let i = 0; i < q.length; i++) {
+    const [x, y] = q[i];
+    for (let d = 0; d < 4; d++) {
+      const c = s.cells[y][x];
+      if (!(c & (0x10 << d)) || (c & (1 << d))) continue;
+      const nx = x + DX[d], ny = y + DY[d];
+      if (nx < 0 || ny < 0 || nx >= s.w || ny >= s.h || dist[ny][nx] >= 0) continue;
+      dist[ny][nx] = dist[y][x] + 1;
+      q.push([nx, ny]);
+    }
+  }
+  if (dist[0][s.sx] < 0) return null;
+  const path = [[s.sx, 0]];
+  let [x, y] = [s.sx, 0];
+  while (dist[y][x] > 0) {
+    for (let d = 0; d < 4; d++) {
+      const c = s.cells[y][x];
+      if (!(c & (0x10 << d)) || (c & (1 << d))) continue;
+      const nx = x + DX[d], ny = y + DY[d];
+      if (nx < 0 || ny < 0 || nx >= s.w || ny >= s.h) continue;
+      if (dist[ny][nx] === dist[y][x] - 1) { x = nx; y = ny; path.push([x, y]); break; }
+    }
+  }
+  return path;
+}
+
+function draw(i) {
+  const s = snaps[i];
+  const svg = document.getElementById("maze");
+  const C = 56, M = 30;
+  const W = s.w * C + 2 * M, H = s.h * C + 2 * M;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const px = x => M + x * C, py = y => M + (s.h - 1 - y) * C;
+  let g = "";
+  let mapped = 0, seenWalls = 0, totalWalls = 0;
+
+  for (let y = 0; y < s.h; y++) for (let x = 0; x < s.w; x++) {
+    const c = s.cells[y][x];
+    const full = (c & 0xF0) === 0xF0;
+    if (full) mapped++;
+    let fill = full ? "var(--mapped)" : "var(--floor)";
+    if (isGoal(s, x, y)) fill = "var(--goal)";
+    const sel = selected && selected[0] === x && selected[1] === y;
+    g += `<rect class="cell" data-x="${x}" data-y="${y}" x="${px(x)}" y="${py(y)}" width="${C}" height="${C}" fill="${fill}" ${sel ? 'stroke="var(--path)" stroke-width="3"' : ""}/>`;
+  }
+
+  const route = speedRoute(s);
+  if (route) {
+    const pts = route.map(([x, y]) => `${px(x) + C / 2},${py(y) + C / 2}`).join(" ");
+    g += `<polyline points="${pts}" fill="none" stroke="var(--path)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>`;
+  }
+
+  // Each wall once: the N and E side of every cell, plus the S of row 0 and the W of column 0.
+  const edge = (x1, y1, x2, y2, seen, wall) => {
+    if (seen && wall) return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--wall)" stroke-width="5" stroke-linecap="round"/>`;
+    if (!seen) return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--unseen)" stroke-width="1.5" stroke-dasharray="4 5"/>`;
+    return "";
+  };
+  for (let y = 0; y < s.h; y++) for (let x = 0; x < s.w; x++) {
+    const c = s.cells[y][x], X = px(x), Y = py(y);
+    const sides = [[0, X, Y, X + C, Y], [1, X + C, Y, X + C, Y + C]];
+    if (y === 0) sides.push([2, X, Y + C, X + C, Y + C]);
+    if (x === 0) sides.push([3, X, Y, X, Y + C]);
+    for (const [d, a, b, e, f] of sides) {
+      totalWalls++;
+      const seen = !!(c & (0x10 << d));
+      if (seen) seenWalls++;
+      g += edge(a, b, e, f, seen, !!(c & (1 << d)));
+    }
+  }
+  for (let y = 0; y <= s.h; y++) for (let x = 0; x <= s.w; x++)
+    g += `<rect x="${px(x) - 3}" y="${py(y - 1) - 3}" width="6" height="6" fill="var(--wall)"/>`;
+
+  // Start label, goal label, coordinates.
+  g += `<text x="${px(s.sx) + 6}" y="${py(0) + C - 8}" font-family="var(--font-mono)" font-size="11" font-weight="600" fill="var(--muted)">START</text>`;
+  for (let x = 0; x < s.w; x++)
+    g += `<text x="${px(x) + C / 2}" y="${M - 12}" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--muted)">${x}</text>`;
+  for (let y = 0; y < s.h; y++)
+    g += `<text x="${M - 12}" y="${py(y) + C / 2 + 4}" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--muted)">${y}</text>`;
+
+  // Robot.
+  const rx = px(s.rx) + C / 2, ry = py(s.ry) + C / 2;
+  g += `<g transform="translate(${rx} ${ry}) rotate(${s.f * 90})"><path d="M0 -17 L13 13 L0 6 L-13 13 Z" fill="var(--robot)" stroke="var(--panel)" stroke-width="2" stroke-linejoin="round"/></g>`;
+
+  svg.innerHTML = g;
+  svg.querySelectorAll(".cell").forEach(r => {
+    const pick = () => { selected = [+r.dataset.x, +r.dataset.y]; showByte(); draw(i); };
+    r.addEventListener("mouseenter", pick);
+    r.addEventListener("click", pick);
+  });
+
+  document.getElementById("stats").innerHTML =
+    `<div><span>Mapped</span> <b>${mapped} / ${s.w * s.h}</b> cells</div>` +
+    `<div><span>Walls seen</span> <b>${Math.round(100 * seenWalls / totalWalls)}%</b></div>` +
+    `<div><span>Robot</span> <b>(${s.rx}, ${s.ry}) facing ${SIDE[s.f]}</b></div>` +
+    `<div><span>Speed run</span> <b>${route ? (route.length - 1) + " cells" : "no route yet"}</b></div>`;
+  document.getElementById("snapOut").value = `${i + 1} / ${snaps.length}`;
+  showByte();
+}
+
+function showByte() {
+  const s = snaps[+document.getElementById("snap").value];
+  const box = document.getElementById("byte");
+  if (!selected || selected[0] >= s.w || selected[1] >= s.h) selected = [s.rx, s.ry];
+  const [x, y] = selected;
+  const c = s.cells[y][x];
+  const labels = ["seen W", "seen S", "seen E", "seen N", "wall W", "wall S", "wall E", "wall N"];
+  let bits = "";
+  for (let b = 7; b >= 0; b--)
+    bits += `<div class="${c & (1 << b) ? "on" : ""}">${(c >> b) & 1}<small>${labels[7 - b]}</small></div>`;
+  let sides = "";
+  for (let d = 0; d < 4; d++) {
+    const seen = c & (0x10 << d), wall = c & (1 << d);
+    sides += `<dt>${SIDE[d]}</dt><dd>${seen ? (wall ? "wall" : "open") : "not seen yet"}</dd>`;
+  }
+  box.innerHTML =
+    `<div>Cell (${x}, ${y})${isGoal(s, x, y) ? " · goal" : ""}</div>` +
+    `<div class="hex">0x${c.toString(16).toUpperCase().padStart(2, "0")}</div>` +
+    `<div class="bits">${bits}</div>` +
+    `<dl class="sides">${sides}</dl>`;
+}
+
+function load(text) {
+  const msg = document.getElementById("msg");
+  const found = parse(text);
+  if (!found.length) {
+    msg.textContent = "No DATA: line found. Paste the Serial Monitor output from firmware 21 or later.";
+    msg.className = "msg err";
+    return;
+  }
+  snaps = found;
+  const slider = document.getElementById("snap");
+  slider.max = snaps.length - 1;
+  slider.value = snaps.length - 1;
+  selected = null;
+  msg.textContent = `${snaps.length} snapshot${snaps.length > 1 ? "s" : ""} found. Showing the last one.`;
+  msg.className = "msg";
+  draw(snaps.length - 1);
+}
+
+document.getElementById("snap").addEventListener("input", e => { selected = null; draw(+e.target.value); });
+document.getElementById("draw").addEventListener("click", () => load(document.getElementById("log").value));
+document.getElementById("sample").addEventListener("click", () => {
+  document.getElementById("log").value = SAMPLE;
+  load(SAMPLE);
+});
+document.getElementById("log").value = SAMPLE;
+load(SAMPLE);
+</script>
+</body>
+</html>

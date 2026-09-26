@@ -16,3 +16,5 @@ tests/maze_21_section.inc
 tests/micromouse_21_sim
 tests/maze_22_section.inc
 tests/micromouse_22_sim
+tests/maze_23_section.inc
+tests/micromouse_23_sim
