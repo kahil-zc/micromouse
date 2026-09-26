@@ -382,7 +382,7 @@ void putWall(int8_t x, int8_t y, uint8_t d, bool present) {
   if (present) maze[nx][ny] |= 1 << o; else maze[nx][ny] &= ~(1 << o);
 }
 
-// Sets (bits 0x10) or clears the "check" mark (bits 0x01) of one wall, on both cells.
+// Sets or clears one mark of a wall (bit 0x10 = settled, 0x01 = check), on both cells.
 __attribute__((noinline)) void markWall(int8_t x, int8_t y, uint8_t d, uint8_t bit, bool on) {
   int8_t nx = x + DX[d], ny = y + DY[d];
   if (on) fixedW[x][y] |= bit << d; else fixedW[x][y] &= ~(bit << d);
