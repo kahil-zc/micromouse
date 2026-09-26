@@ -15,6 +15,9 @@
 // ║     the front corners sweep, so the long rear gets the room.     ║
 // ║   * Position along the corridor is corrected by the front wall   ║
 // ║     and by side-wall edges (where a wall starts or ends).        ║
+// ║   * The side walls also measure the robot's real angle to the    ║
+// ║     corridor and correct the gyro, so it stays straight through  ║
+// ║     open cells where there is nothing to centre on.              ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 #include <Wire.h>
@@ -106,6 +109,16 @@
 #define KD                  0.2f
 #define WALL_KP             0.5f   // degrees of heading nudge per mm of lateral error
 #define MAX_WALL_NUDGE_DEG  8.0f
+#define TOO_CLOSE_MM        15     // side gap that triggers a hard steer away and a slow-down
+#define CLOSE_NUDGE_DEG     15.0f
+#define CLOSE_PWM           110
+#define FRONT_EMERGENCY_MM  20     // stop at once if the front gets this close
+
+// === GYRO CORRECTION FROM SIDE WALLS ===
+#define WALL_FIT_SPAN_MM    60.0f  // fit the wall angle over this much travel
+#define WALL_FIT_MIN_N      6      // readings needed in one fit
+#define HEADING_TRIM_GAIN   0.3f   // share of the measured gyro error removed per fit
+#define MAX_TRIM_STEP_DEG   1.0f
 
 // === TURNS ===
 #define KP_ARC              3.0f
@@ -146,6 +159,7 @@ unsigned long lastGyroMicros = 0;
 int16_t lastGyroRaw = 0;
 
 int tofL = 999, tofF = 999, tofR = 999;
+float centreGap = SIDE_GAP_MM;    // learned side reading when centred, used when only one wall
 uint8_t seqL = 0, seqR = 0;       // bump on every new side reading
 long accL = 0, accR = 0;          // side reading sums for averageSides()
 uint16_t cntL = 0, cntR = 0;
@@ -172,6 +186,12 @@ struct SideEdge {
   bool known, wall, pending;
   float since, pendingAt;
   uint8_t pendingCount;
+};
+
+// Straight-line fit of one side reading against distance driven (see fitUpdate).
+struct WallFit {
+  uint8_t n;
+  float x0, sx, sy, sxx, sxy, sPsi;
 };
 
 // --- INTERRUPT SERVICE ROUTINES ---
@@ -350,10 +370,19 @@ float headingCorrection(bool useWalls) {
     bool hasL = tofL < SIDE_FOLLOW_MM;
     bool hasR = tofR < SIDE_FOLLOW_MM;
     float lateralErr = 0;                          // > 0: robot is right of centre
-    if (hasL && hasR) lateralErr = (tofL - tofR) / 2.0f;
-    else if (hasL)    lateralErr = tofL - SIDE_GAP_MM;
-    else if (hasR)    lateralErr = SIDE_GAP_MM - tofR;
-    desired += constrain(lateralErr * WALL_KP, -MAX_WALL_NUDGE_DEG, MAX_WALL_NUDGE_DEG);
+    if (hasL && hasR) {
+      lateralErr = (tofL - tofR) / 2.0f;
+      // (L + R) / 2 is the centred reading wherever the robot is; learn it so one-wall
+      // stretches aim at the same line and the robot doesn't jump when a wall ends.
+      centreGap += 0.02f * ((tofL + tofR) / 2.0f - centreGap);
+      centreGap = constrain(centreGap, SIDE_GAP_MM - 10, SIDE_GAP_MM + 10);
+    }
+    else if (hasL) lateralErr = tofL - centreGap;
+    else if (hasR) lateralErr = centreGap - tofR;
+    // About to touch a wall: steer away twice as hard with a bigger limit.
+    bool tooClose = (hasL && tofL < TOO_CLOSE_MM) || (hasR && tofR < TOO_CLOSE_MM);
+    float limit = tooClose ? CLOSE_NUDGE_DEG : MAX_WALL_NUDGE_DEG;
+    desired += constrain(lateralErr * WALL_KP * (tooClose ? 2 : 1), -limit, limit);
   }
   return KP * (desired - absoluteHeading) - KD * gyroRate;
 }
@@ -389,6 +418,39 @@ void edgeUpdate(SideEdge &e, int tof, float done, float &corrMm, float startAxle
   }
 }
 
+// --- GYRO CORRECTION FROM SIDE WALLS ---
+// While a side wall is present, the reading against distance driven is a straight line whose
+// slope is the robot's real angle to the corridor. Comparing that with the gyro's angle over
+// the same stretch shows how far the gyro has drifted (turn scale error, bias drift), and the
+// gyro is pulled back a little each time.
+void resetFit(WallFit &f) { f.n = 0; }
+
+// sideSign: +1 = left wall, -1 = right wall.
+void fitUpdate(WallFit &f, int tof, float done, int sideSign) {
+  if (tof >= SIDE_FOLLOW_MM) { f.n = 0; return; }  // no wall: start again
+  if (f.n == 0) { f.x0 = done; f.sx = f.sy = f.sxx = f.sxy = f.sPsi = 0; }
+  float x = done - f.x0;
+  f.n++;
+  f.sx += x; f.sy += tof; f.sxx += x * x; f.sxy += x * tof;
+  f.sPsi += absoluteHeading - targetHeading;
+  if (f.n < WALL_FIT_MIN_N || x < WALL_FIT_SPAN_MM) return;
+
+  float den = f.n * f.sxx - f.sx * f.sx;
+  if (den > 1) {
+    float slope = (f.n * f.sxy - f.sx * f.sy) / den;
+    // Turned toward the left wall = left reading shrinks and right reading grows.
+    float wallPsi = -sideSign * asin(constrain(slope, -0.3f, 0.3f)) * RAD_TO_DEG;
+    float gyroPsi = f.sPsi / f.n;
+    float err = gyroPsi - wallPsi;
+    if (fabs(err) < 8) {  // larger means a bad fit (post, open cell), not drift
+      float step = constrain(err * HEADING_TRIM_GAIN, -MAX_TRIM_STEP_DEG, MAX_TRIM_STEP_DEG);
+      absoluteHeading -= step;
+      Serial.print(F("Gyro corrected from wall by ")); Serial.println(-step);
+    }
+  }
+  f.n = 0;
+}
+
 // --- MOVEMENT BEHAVIOURS ---
 // Drives distMm (negative = reverse) holding targetHeading.
 //  center:      steer toward the corridor centre using the side walls
@@ -399,10 +461,13 @@ int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float 
   bool reverse = distMm < 0;
   float goal = fabs(distMm);
   bool useEdges = !reverse && !isnan(startAxleMm);
+  bool useFit = center && !reverse;
   int result = DRIVE_DONE;
   float corr = 0;
   SideEdge edgeL, edgeR;
   resetEdge(edgeL); resetEdge(edgeR);
+  WallFit fitL, fitR;
+  resetFit(fitL); resetFit(fitR);
   uint8_t lastSeqL = seqL, lastSeqR = seqR;
   resetTicks();
   float lastDone = 0;
@@ -411,9 +476,20 @@ int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float 
   while (true) {
     sense();
     float done = travelledMm();
-    if (useEdges) {
-      if (seqL != lastSeqL) { lastSeqL = seqL; edgeUpdate(edgeL, tofL, done, corr, startAxleMm, 'L'); }
-      if (seqR != lastSeqR) { lastSeqR = seqR; edgeUpdate(edgeR, tofR, done, corr, startAxleMm, 'R'); }
+    if (seqL != lastSeqL) {
+      lastSeqL = seqL;
+      if (useEdges) edgeUpdate(edgeL, tofL, done, corr, startAxleMm, 'L');
+      if (useFit) fitUpdate(fitL, tofL, done, +1);
+    }
+    if (seqR != lastSeqR) {
+      lastSeqR = seqR;
+      if (useEdges) edgeUpdate(edgeR, tofR, done, corr, startAxleMm, 'R');
+      if (useFit) fitUpdate(fitR, tofR, done, -1);
+    }
+    if (!reverse && tofF < FRONT_EMERGENCY_MM) {
+      Serial.println(F("FRONT TOO CLOSE - emergency stop"));
+      result = DRIVE_WALL;
+      break;
     }
     float remaining = goal - done - corr;
     bool wallLimited = false;
@@ -436,6 +512,7 @@ int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float 
       float down = MIN_DRIVE_PWM + DECEL_PWM_PER_MM * remaining;
       float pwm = up < down ? up : down;
       if (pwm > maxPwm) pwm = maxPwm;
+      if (center && (tofL < TOO_CLOSE_MM || tofR < TOO_CLOSE_MM) && pwm > CLOSE_PWM) pwm = CLOSE_PWM;
       if (reverse) pwm = -pwm;
       float c = headingCorrection(center && !reverse);  // wall nudges steer the wrong way in reverse
       setMotors((int)(pwm - c), (int)(pwm + c));
