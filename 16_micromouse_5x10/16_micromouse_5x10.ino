@@ -11,7 +11,7 @@
 // ║    every press after that = SPEED RUN to the goal and back home  ║
 // ║    long press (1 s, LED on) = explore again                      ║
 // ║    press while exploring = stop and drive home                   ║
-// ║    held while powering on = forget the saved map                 ║
+// ║    double click, or held while powering on = forget the map      ║
 // ║  The map is saved in EEPROM, so it survives switching off.       ║
 // ║                                                                  ║
 // ║  The goal is the 2x2 room with no walls inside: the place where  ║
@@ -175,6 +175,7 @@
 #define GYRO_CALIB_SAMPLES  200
 #define MAX_FAILS           3      // consecutive failed moves before giving up
 #define LONG_PRESS_MS       1000
+#define DOUBLE_CLICK_MS     400    // second press within this = double click
 #define EEPROM_MAGIC        (0xD0 ^ MAZE_W ^ (MAZE_H << 4))
 
 #define DRIVE_STALL 0
@@ -1236,7 +1237,8 @@ void reportPath() {
 bool speedRunReady() { return knownPathLength() != 255; }
 
 // --- RUN CONTROL ---
-// Returns 0 = not pressed, 1 = short press, 2 = long press (LED lights once it counts as long).
+// Returns 0 = not pressed, 1 = short press, 2 = long press (LED lights once it counts as long),
+// 3 = double click.
 int readButton() {
   if (digitalRead(START_BUTTON) != LOW) return 0;
   delay(30);
@@ -1246,7 +1248,26 @@ int readButton() {
     if (millis() - t > LONG_PRESS_MS) digitalWrite(STATUS_LED, HIGH);
   }
   digitalWrite(STATUS_LED, LOW);
-  return (millis() - t > LONG_PRESS_MS) ? 2 : 1;
+  if (millis() - t > LONG_PRESS_MS) return 2;
+  delay(30);  // let the release bounce settle
+  unsigned long released = millis();
+  while (millis() - released < DOUBLE_CLICK_MS) {
+    if (digitalRead(START_BUTTON) == LOW) {
+      delay(30);
+      while (digitalRead(START_BUTTON) == LOW);
+      return 3;
+    }
+  }
+  return 1;
+}
+
+// Forgets the saved map, goal and start corner.
+void clearMap() {
+  initMaze();
+  startX = 0; cornerKnown = false;
+  resetStart();
+  posX = startX; posY = 0; facing = 0;
+  saveMaze();
 }
 
 void blink(uint8_t times) {
@@ -1385,10 +1406,7 @@ void setup() {
   printGeometryCheck();
 
   if (digitalRead(START_BUTTON) == LOW) {
-    initMaze();
-    startX = 0; cornerKnown = false;
-    resetStart();
-    saveMaze();
+    clearMap();
     Serial.println(F("\nMap cleared."));
     while (digitalRead(START_BUTTON) == LOW);
     delay(50);
@@ -1422,7 +1440,11 @@ void loop() {
     Serial.print(F("  R ")); Serial.println(tofR);
   }
   int b = readButton();
-  if (b == 1 && speedRunReady()) {
+  if (b == 3) {
+    clearMap();
+    blink(3);
+    Serial.println(F("\nMap cleared. Press = EXPLORE."));
+  } else if (b == 1 && speedRunReady()) {
     Serial.println(F("\n--- SPEED RUN ---"));
     beginRun(PH_FAST);
   } else if (b != 0) {
