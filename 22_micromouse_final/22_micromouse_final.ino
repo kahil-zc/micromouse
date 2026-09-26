@@ -47,8 +47,10 @@
 // ║     cells ahead goes in the map; a wall one cell ahead fixes the ║
 // ║     position.                                                    ║
 // ║   * Before a turn: a front wall = pull up to it (front ToF). No  ║
-// ║     front wall = the side ToF must see the opening (creep on     ║
-// ║     until it does), then TURN_LATE_MM further before turning.    ║
+// ║     front wall = the side ToF (averaged) must see the opening    ║
+// ║     (creep on until 2 readings do), then turn 5 mm late.         ║
+// ║   * First stop after a turn: more than 6 mm off the corridor     ║
+// ║     centre = shuffle back to the centre (side ToFs).             ║
 // ║   * Before going straight from a stop: more than 12 mm off the   ║
 // ║     corridor centre = shuffle back to the centre first.          ║
 // ║                                                                  ║
