@@ -2,3 +2,5 @@ tests/maze_section.inc
 tests/floodfill_final_sim
 tests/maze_final_section.inc
 tests/micromouse_final_sim
+tests/maze_5x10_section.inc
+tests/micromouse_5x10_sim
