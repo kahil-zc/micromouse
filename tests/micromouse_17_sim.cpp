@@ -1,0 +1,307 @@
+// Runs the maze section of 17_micromouse_final.ino on random 10-across x 5-ahead mazes.
+//   tests/micromouse_17_sim.sh
+// The script copies the lines between "// --- MAZE (no hardware calls) ---" and
+// "// --- END MAZE ---" into maze_17_section.inc, so this tests the exact planner the robot runs.
+//
+// Each maze is 5 x 10 cells, either way round (the robot's map is a 10 x 10 box), has a 2x2 goal
+// room with one entrance somewhere, every other post has a wall, and the start is in the left or
+// right corner; the robot is told none of this. It explores with the same calls as runStep()
+// (read the three walls of the cell it stands in, every cell, plan, drive one cell), then does
+// a speed run and drives home.
+//
+// Part 1, perfect readings. Fails if it drives through a wall, loops, maps a cell twice, picks
+// the wrong goal, or the speed run is not the true shortest path.
+// Part 2, noisy readings: every wall reading is wrong with some chance. A reading that disagrees
+// with the map is read again, as senseWallsHere() does, and a wall the robot drives at stops it
+// (the front ToF, as in driveStraight). Fails if it loops or never gets home; reports how often
+// it still found the right goal and a correct speed run.
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAZE_W 10
+#define MAZE_H 10
+#define START_CORNER 0
+#define MAX_IMPROVE_CELLS 60
+#define MAZE_SHORT 5
+#define MAZE_LONG 10
+
+#include "maze_17_section.inc"
+
+#define MAXT 10
+static uint8_t truth[MAXT][MAXT];  // bits 0-3: real walls
+static int TW, TH;                 // real maze size
+static int trueGoalX, trueGoalY, trueStartX;
+static bool inTrue(int x, int y) { return x >= 0 && y >= 0 && x < TW && y < TH; }
+
+static void trueWall(int x, int y, int d, bool on) {
+  int nx = x + DX[d], ny = y + DY[d];
+  uint8_t o = (d + 2) & 3;
+  if (on) { truth[x][y] |= 1 << d; if (inTrue(nx, ny)) truth[nx][ny] |= 1 << o; }
+  else    { truth[x][y] &= ~(1 << d); if (inTrue(nx, ny)) truth[nx][ny] &= ~(1 << o); }
+}
+
+static bool inTrueGoal(int x, int y) {
+  return x >= trueGoalX && x <= trueGoalX + 1 && y >= trueGoalY && y <= trueGoalY + 1;
+}
+
+static bool postHasWall(int px, int py) {
+  return (truth[px][py] & 2) || (truth[px][py] & 1) || (truth[px + 1][py + 1] & 8) || (truth[px + 1][py + 1] & 4);
+}
+
+static void makeMaze(bool rightCorner) {
+  memset(truth, 0x0F, sizeof(truth));
+  trueStartX = rightCorner ? TW - 1 : 0;
+  do {
+    trueGoalX = rand() % (TW - 1);
+    trueGoalY = 1 + rand() % (TH - 2);
+  } while (inTrueGoal(trueStartX, 0));
+
+  static bool seen[MAXT][MAXT];
+  memset(seen, 0, sizeof(seen));
+  for (int x = trueGoalX; x <= trueGoalX + 1; x++)
+    for (int y = trueGoalY; y <= trueGoalY + 1; y++) seen[x][y] = true;
+  static int sx[MAXT * MAXT], sy[MAXT * MAXT];
+  int top = 1;
+  sx[0] = trueStartX; sy[0] = 0; seen[trueStartX][0] = true;
+  while (top) {
+    int x = sx[top - 1], y = sy[top - 1];
+    int opts[4], n = 0;
+    for (int d = 0; d < 4; d++) {
+      int nx = x + DX[d], ny = y + DY[d];
+      if (inTrue(nx, ny) && !seen[nx][ny]) opts[n++] = d;
+    }
+    if (!n) { top--; continue; }
+    int d = opts[rand() % n];
+    trueWall(x, y, d, false);
+    int nx = x + DX[d], ny = y + DY[d];
+    seen[nx][ny] = true; sx[top] = nx; sy[top] = ny; top++;
+  }
+  // Goal room: open inside, one entrance to a cell outside it.
+  for (int x = trueGoalX; x <= trueGoalX + 1; x++)
+    for (int y = trueGoalY; y <= trueGoalY + 1; y++)
+      for (int d = 0; d < 4; d++) trueWall(x, y, d, !inTrueGoal(x + DX[d], y + DY[d]));
+  static const int ex[8][3] = { {0,0,2},{1,0,2},{1,0,1},{1,1,1},{1,1,0},{0,1,0},{0,1,3},{0,0,3} };
+  for (;;) {
+    const int *e = ex[rand() % 8];
+    int x = trueGoalX + e[0], y = trueGoalY + e[1];
+    if (!inTrue(x + DX[e[2]], y + DY[e[2]])) continue;
+    trueWall(x, y, e[2], false);
+    break;
+  }
+  // A few loops, never leaving a post with no wall (only the goal post may be bare).
+  for (int i = 0; i < 8; i++) {
+    int x = rand() % TW, y = rand() % TH, d = rand() % 4;
+    int nx = x + DX[d], ny = y + DY[d];
+    if (!inTrue(nx, ny) || inTrueGoal(x, y) || inTrueGoal(nx, ny) || !(truth[x][y] & (1 << d))) continue;
+    trueWall(x, y, d, false);
+    bool ok = true;
+    for (int px = 0; px < TW - 1 && ok; px++)
+      for (int py = 0; py < TH - 1 && ok; py++)
+        if (!(px == trueGoalX && py == trueGoalY) && !postHasWall(px, py)) ok = false;
+    if (!ok) trueWall(x, y, d, true);
+  }
+  // Start cell: only ahead open.
+  trueWall(trueStartX, 0, 1, true);
+  trueWall(trueStartX, 0, 3, true);
+  trueWall(trueStartX, 0, 0, false);
+}
+
+static int reachable = 0, resets = 0;
+static int trueShortest() {
+  static int d[MAXT][MAXT];
+  for (int x = 0; x < TW; x++) for (int y = 0; y < TH; y++) d[x][y] = -1;
+  static int qx[MAXT * MAXT], qy[MAXT * MAXT];
+  int h = 0, t = 0, best = -1;
+  d[trueStartX][0] = 0; qx[t] = trueStartX; qy[t++] = 0;
+  while (h < t) {
+    int x = qx[h], y = qy[h++];
+    if (inTrueGoal(x, y) && best < 0) best = d[x][y];
+    for (int k = 0; k < 4; k++) {
+      if (truth[x][y] & (1 << k)) continue;
+      int nx = x + DX[k], ny = y + DY[k];
+      if (d[nx][ny] >= 0) continue;
+      d[nx][ny] = d[x][y] + 1; qx[t] = nx; qy[t++] = ny;
+    }
+  }
+  reachable = t;
+  return best;
+}
+
+static int offX() { return trueStartX - startX; }
+static bool trueWallAt(int x, int y, int d) {
+  int tx = x + offX();
+  if (!inTrue(tx, y)) return true;
+  return truth[tx][y] & (1 << d);
+}
+
+static double noise = 0;  // chance that one wall reading is wrong
+static bool readWall(int x, int y, int d) {
+  bool w = trueWallAt(x, y, d);
+  return (rand() < noise * RAND_MAX) ? !w : w;
+}
+
+// What senseWallsHere() does, from the true maze: a mapped cell whose reading disagrees with
+// the map is read again, and a wall changes only when both readings agree; an opening left of
+// the start column counts only if two readings see it.
+static int senses = 0, corrections = 0;
+static uint8_t readWalls() {
+  uint8_t w = 0;
+  for (uint8_t i = 0; i < 3; i++) if (readWall(posX, posY, (facing + 3 + i) & 3)) w |= 1 << i;
+  return w;
+}
+static void senseHere() {
+  uint8_t walls = readWalls();
+  if (!visited(posX, posY)) {
+    senses++;
+    if (showsRightCorner(walls)) walls |= readWalls();
+  } else if (walls != mapWalls()) {
+    uint8_t same = ~(walls ^ readWalls());
+    walls = (walls & same) | (mapWalls() & ~same);
+    if (walls != mapWalls()) corrections++;
+  }
+  recordWalls(walls);
+}
+
+// Same order as runStep(). Returns cells driven (stops counted separately), or -1 on failure.
+static int run(uint8_t firstPhase, int &stops) {
+  resetStart();
+  posX = startX; posY = 0; facing = 0;
+  putWall(startX, 0, 2, true);
+  phase = firstPhase;
+  exploreX = exploreY = -1;
+  int cells = 0;
+  stops = 0;
+  for (int steps = 0; steps < 3000; steps++) {
+    if (phase != PH_FAST) {
+      bool wasNew = !visited(posX, posY);
+      senseHere();
+      if (wasNew && visited(posX, posY)) newCells++;
+    }
+    uint8_t dir = facing;
+    uint8_t n = plan(dir);
+    if (noRoute) {
+      if (noise == 0) { printf("  no route (phase %d)\n", phase); return -1; }
+      resets++;
+      initMaze(); resetStart(); putWall(startX, 0, 2, true);
+      if (phase == PH_IMPROVE) phase = PH_EXPLORE;
+      continue;
+    }
+    if (phase == PH_DONE) return cells;
+    if (n == 0) continue;
+    if (phase != PH_FAST && n != 1) { printf("  drove %d cells without stopping\n", n); return -1; }
+    facing = dir;
+    uint8_t done = 0;
+    for (; done < n; done++) {
+      if (trueWallAt(posX, posY, dir)) break;
+      advance(dir, 1);
+    }
+    if (done < n) {
+      if (noise == 0) { printf("  drove at a wall at (%d,%d) dir %d, phase %d\n", posX + offX(), posY, dir, phase); return -1; }
+      putWall(posX, posY, dir, true);  // the front ToF stops it
+    }
+    cells += done;
+    stops++;
+  }
+  printf("  loops (phase %d)\n", phase);
+  return -1;
+}
+
+// Speed run to the goal: cells driven, or -1 if it never got there.
+static int speedRun() {
+  resetStart();
+  posX = startX; posY = 0; facing = 0; phase = PH_FAST;
+  int fastCells = 0;
+  for (int steps = 0; steps < 200; steps++) {
+    uint8_t dir = facing;
+    uint8_t n = plan(dir);
+    if (phase != PH_FAST) break;
+    if (n == 0) return -1;
+    facing = dir;
+    for (uint8_t i = 0; i < n; i++) {
+      if (trueWallAt(posX, posY, dir)) {
+        if (noise == 0) return -1;
+        putWall(posX, posY, dir, true);  // the front ToF stops it; plan again on known walls
+        break;
+      }
+      advance(dir, 1);
+      fastCells++;
+    }
+  }
+  return phase == PH_RETURN ? fastCells : -1;
+}
+
+static int buildMaze(int m) {
+  srand(m + 1);
+  int shortest;
+  do {  // every cell must be reachable (a goal room next to the start can wall the rest off)
+    if (m % 4 < 2) { TW = 10; TH = 5; } else { TW = 5; TH = 10; }
+    makeMaze(m % 2 == 1);
+    shortest = trueShortest();
+  } while (reachable != TW * TH);
+  return shortest;
+}
+
+int main() {
+  const int N = 1000;
+  int fails = 0;
+  long exploreCells = 0, exploreStops = 0, reachableTotal = 0, sensedTotal = 0;
+  for (int m = 0; m < N; m++) {
+    int shortest = buildMaze(m);
+    if (shortest < 0) { printf("maze %d: generator made no path\n", m); fails++; continue; }
+
+    initMaze();
+    startX = 0; cornerKnown = false;
+    int stops;
+    senses = 0;
+    int e = run(PH_EXPLORE, stops);
+    if (e < 0) { printf("maze %d: explore failed\n", m); fails++; continue; }
+    exploreCells += e; exploreStops += stops; reachableTotal += reachable;
+
+    if (senses > TW * TH) { printf("maze %d: mapped %d cells for %d cells\n", m, senses, TW * TH); fails++; continue; }
+    sensedTotal += senses;
+    if ((startX == 0) != (trueStartX == 0)) { printf("maze %d: start corner wrong\n", m); fails++; continue; }
+    if (!goalKnown || goalX + offX() != trueGoalX || goalY != trueGoalY) {
+      printf("maze %d: goal wrong\n", m); fails++; continue;
+    }
+    int fastCells = speedRun();
+    if (fastCells < 0) { printf("maze %d: speed run failed\n", m); fails++; continue; }
+    if (fastCells != shortest) { printf("maze %d: speed run %d cells, shortest %d\n", m, fastCells, shortest); fails++; continue; }
+    int s2;
+    if (run(PH_RETURN, s2) < 0) { printf("maze %d: return failed\n", m); fails++; continue; }
+  }
+  printf("PERFECT READINGS: %d mazes (5 x 10 both ways round, goal room and start corner found by the robot): %d failures\n", N, fails);
+  printf("  search + home: drove %.1f cells (stopping in every cell), mapped %.1f of %.1f cells; no cell mapped twice\n",
+         (double)exploreCells / N, (double)sensedTotal / N, (double)reachableTotal / N);
+
+  static const double noises[] = { 0.01, 0.03 };
+  for (int k = 0; k < 2; k++) {
+    noise = noises[k];
+    int stuck = 0, goalOk = 0, fastOk = 0, fastShortest = 0;
+    corrections = 0; resets = 0;
+    for (int m = 0; m < N; m++) {
+      int shortest = buildMaze(m);
+      srand(7919 * (m + 1) + k);
+      initMaze();
+      startX = 0; cornerKnown = false;
+      int stops;
+      if (run(PH_EXPLORE, stops) < 0) { printf("noisy maze %d: explore never got home\n", m); stuck++; continue; }
+      bool rightGoal = goalKnown && goalX + offX() == trueGoalX && goalY == trueGoalY && (startX == 0) == (trueStartX == 0);
+      if (!rightGoal) continue;
+      goalOk++;
+      int fastCells = speedRun();
+      if (fastCells < 0) continue;
+      fastOk++;
+      if (fastCells == shortest) fastShortest++;
+      int s2;
+      if (run(PH_RETURN, s2) < 0) { printf("noisy maze %d: return never got home\n", m); stuck++; }
+    }
+    fails += stuck;
+    printf("%.0f%% OF WALL READINGS WRONG: %d mazes, %d stuck; right goal %d, speed run reached it %d (%d shortest); "
+           "%d map corrections, %d map resets\n",
+           noise * 100, N, stuck, goalOk, fastOk, fastShortest, corrections, resets);
+  }
+  return fails ? 1 : 0;
+}
