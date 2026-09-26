@@ -427,7 +427,8 @@ void forgetWalls() {
   for (int x = 0; x < MAP_W; x++)
     for (int y = 0; y < MAP_H; y++)
       for (uint8_t d = 0; d < 4; d++)
-        if (inMaze(x + DX[d], y + DY[d])) maze[x][y] &= ~((1 << d) | (0x10 << d));
+        if (inMaze(x + DX[d], y + DY[d]) && !(driven[x][y] & (1 << d)))
+          maze[x][y] &= ~((1 << d) | (0x10 << d));
 }
 
 // Flood toward the target and pick the next heading from here (search: one cell at a time).
@@ -1066,6 +1067,7 @@ int moveCells(int numCells, int maxPwm) {
   float axle = carry0 + lastMovedMm;  // from the start cell's decision point
   int k = constrain((int)round(axle / CELL_MM), 0, numCells);
   carryMm = (r == DRIVE_WALL) ? 0 : axle - k * CELL_MM;
+  lastL = tofL; lastR = tofR;  // fresh side readings where it stopped (for centreInCorridor)
   return k;
 }
 
@@ -1208,6 +1210,7 @@ void pauseForHelp() {
   int b;
   do { b = readButton(); } while (b == 0);
   pauseRequested = false;
+  frontCloseCount = 0;
   if (b != 1) { runState = ST_WAIT; return; }
   delay(500);  // let go of the robot
   recalGyroBias();
@@ -1231,6 +1234,7 @@ void beginRun(int state) {
   pauseRequested = false;
   atCentre = false;
   justTurned = false;
+  lastL = lastR = 999;
   runState = state;
 }
 
@@ -1258,19 +1262,20 @@ bool doMove(uint8_t d, int n, int pwm) {
     else if (m == 'S') centreInCorridor(CENTRE_TOL_MM);
   }
   justTurned = false;
-  uint8_t oldFacing = facing;
   int t = executeTurn(m);
   if (t == TURN_BLOCKED) {  // the map was wrong: a wall there after all. Plan again.
     setWall(posX, posY, d, true);
     return true;
   }
-  if (t != TURN_OK || pauseRequested) { facing = oldFacing; pauseForHelp(); return false; }
+  if (t != TURN_OK) { pauseForHelp(); return false; }  // turn failed: still facing the old way
   facing = d;
+  if (pauseRequested) { pauseForHelp(); return false; }
   int k = moveCells(n, pwm);
   atCentre = false;
-  if (k < 0 || pauseRequested) { facing = oldFacing; pauseForHelp(); return false; }
+  if (k < 0) { pauseForHelp(); return false; }  // stuck or about to crash: last stop, facing d
   advance(d, k);
   if (k < n) setWall(posX, posY, d, true);  // the front ToF found a wall the map didn't have
+  if (pauseRequested) { pauseForHelp(); return false; }  // stopped in the new cell: resume there
   return true;
 }
 
