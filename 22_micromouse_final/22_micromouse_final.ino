@@ -211,7 +211,11 @@
 #define SENSE_MS            150    // how long to average the ToFs when reading the walls
 #define FRONT_FIX_MAX_MM    40.0f  // trust a front-wall position fix only this close to the encoders
 #define CENTRE_TOL_MM       12.0f  // before a straight, shuffle to the centre if further off than this
-#define TURN_LATE_MM        20.0f  // no front wall: start a 90° turn this far after the decision point
+#define TURN_LATE_MM         5.0f  // no front wall: start a 90° turn this far after the decision point
+#define SETTLE_LATE_TOL_MM  12.0f  // before a turn, up to this far past the decision point is fine
+#define POST_TURN_STOP_MM   10.0f  // after a turn, stop this far past the next decision point (clear of the post)
+#define POST_TURN_TOL_MM     6.0f  // after a turn, shuffle to the corridor centre if further off than this
+#define OPENING_TIMEOUT_MS  2500   // give up creeping toward an opening after this long
 #define OPENING_MAX_CREEP_MM 100.0f // no opening seen after creeping this far: the map is wrong there
 // Clear-cut readings (far from the wall / no-wall thresholds): only these may change a wall
 // that is already in the map, or open a wall further down the corridor.
@@ -264,6 +268,7 @@ bool lastDriveCrashed = false;
 float odoMm = 0;                  // distance driven straight since the last turn
 bool backToWall = false;          // rear is against a wall: never reverse
 bool atCentre = false;            // put back by hand in the middle of a cell (see pauseAndRedo)
+bool justTurned = false;          // the last move was a 90° arc: centre at the next stop
 
 int runState = ST_WAIT;
 bool pauseRequested = false;      // button pressed during a run
@@ -717,6 +722,9 @@ void initToF(VL53L0X &sensor, uint8_t xshutPin, uint8_t addr) {
     sensor.setAddress(addr);
     sensor.setMeasurementTimingBudget(20000);
     sensor.startContinuous();
+  } else {
+    digitalWrite(xshutPin, LOW);  // keep it off so it can't answer at the next sensor's address
+    Serial.print(F("ToF FAILED on pin A")); Serial.println(xshutPin - A0);
   }
 }
 
@@ -747,25 +755,19 @@ int16_t readGyroZRaw() {
   return lastGyroRaw;
 }
 
-void calibrateGyro() {
+// Measures the gyro bias over n samples without touching the heading (robot must be still).
+void recalGyroBias(int n) {
   long sum = 0;
-  for (int i = 0; i < GYRO_CALIB_SAMPLES; i++) {
-    sum += readGyroZRaw(); delay(3);
-  }
-  gyroZOffset = (float)sum / GYRO_CALIB_SAMPLES;
-  absoluteHeading = 0.0f;
-  targetHeading = 0.0f;
+  for (int i = 0; i < n; i++) { sum += readGyroZRaw(); delay(3); }
+  gyroZOffset = (float)sum / n;
   gyroRate = 0.0f;
   lastGyroMicros = micros();
 }
 
-// Re-measures the gyro bias without touching the heading (robot must be still).
-void recalGyroBias() {
-  long sum = 0;
-  for (int i = 0; i < 100; i++) { sum += readGyroZRaw(); delay(2); }
-  gyroZOffset = (float)sum / 100;
-  gyroRate = 0.0f;
-  lastGyroMicros = micros();
+void calibrateGyro() {
+  recalGyroBias(GYRO_CALIB_SAMPLES);
+  absoluteHeading = 0.0f;
+  targetHeading = 0.0f;
 }
 
 void updateGyro() {
@@ -777,26 +779,23 @@ void updateGyro() {
 }
 
 // Non-blocking: only reads a sensor that has a new measurement ready.
+// One sensor: if it has a new measurement, stores it (minus its bias; 999 = nothing in range),
+// adds it to the averaging sums and bumps seq. False if nothing new.
+bool readToF(VL53L0X &sensor, int bias, int &tof, long &acc, uint16_t &cnt, uint8_t &seq) {
+  if (!(sensor.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07)) return false;
+  uint16_t r = sensor.readRangeContinuousMillimeters();
+  tof = (r > 8000) ? 999 : (int)r - bias;
+  seq++;
+  if (tof != 999) { acc += tof; cnt++; }
+  return true;
+}
+
 void updateToF() {
-  if (sensorLeft.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) {
-    uint16_t r = sensorLeft.readRangeContinuousMillimeters();
-    tofL = (r > 8000) ? 999 : (int)r - LEFT_BIAS_MM;
-    seqL++;
-    if (tofL != 999) { accL += tofL; cntL++; }
-  }
-  if (sensorFront.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) {
-    uint16_t r = sensorFront.readRangeContinuousMillimeters();
-    tofF = (r > 8000) ? 999 : (int)r - FRONT_BIAS_MM;
-    frontCloseCount = (tofF < FRONT_EMERGENCY_MM) ? frontCloseCount + 1 : 0;
-    if (frontCloseCount > 3) frontCloseCount = 3;
-    if (tofF != 999) { accF += tofF; cntF++; }
-  }
-  if (sensorRight.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) {
-    uint16_t r = sensorRight.readRangeContinuousMillimeters();
-    tofR = (r > 8000) ? 999 : (int)r - RIGHT_BIAS_MM;
-    seqR++;
-    if (tofR != 999) { accR += tofR; cntR++; }
-  }
+  static uint8_t seqF;
+  readToF(sensorLeft, LEFT_BIAS_MM, tofL, accL, cntL, seqL);
+  if (readToF(sensorFront, FRONT_BIAS_MM, tofF, accF, cntF, seqF))
+    frontCloseCount = (tofF < FRONT_EMERGENCY_MM) ? (frontCloseCount < 3 ? frontCloseCount + 1 : 3) : 0;
+  readToF(sensorRight, RIGHT_BIAS_MM, tofR, accR, cntR, seqR);
 }
 
 // Called in every loop: keeps the gyro integrating and the ToF values fresh.
@@ -925,7 +924,7 @@ void fitUpdate(WallFit &f, int tof, float x, int sideSign) {
   if (den > 1) {
     float slope = (f.n * f.sxy - f.sx * f.sy) / den;
     // Turned toward the left wall = left reading shrinks and right reading grows.
-    float wallPsi = -sideSign * asin(constrain(slope, -0.3f, 0.3f)) * RAD_TO_DEG;
+    float wallPsi = -sideSign * constrain(slope, -0.3f, 0.3f) * RAD_TO_DEG;  // small angle: asin(s) ~ s
     float gyroPsi = f.sPsi / f.n;
     float err = gyroPsi - wallPsi;
     if (fabs(err) < 8) {  // larger means a bad fit (post, open cell), not drift
@@ -1172,7 +1171,7 @@ void squareOnBackWall() {
   delay(300);
   stopMotors();
   delay(150);
-  recalGyroBias();
+  recalGyroBias(100);
   absoluteHeading = targetHeading;
   carryMm = BACK_TO_WALL_CARRY_MM;
   backToWall = true;
@@ -1180,37 +1179,59 @@ void squareOnBackWall() {
   resetFits();
 }
 
+// Sideways offset from the corridor centre from two side readings: > 0 = right of centre.
+// NAN = no side wall to tell.
+__attribute__((noinline)) float lateralOffset(float l, float r) {
+  bool hasL = l < SIDE_FOLLOW_MM, hasR = r < SIDE_FOLLOW_MM;
+  if (hasL && hasR) return (l - r) / 2;
+  if (hasL) return l - centreGap;
+  if (hasR) return centreGap - r;
+  return NAN;
+}
+
 // Before an arc: if the robot is too close to the wall the rear corner swings toward,
 // shuffle toward the turn side. That shift only moves the end point along the new corridor,
-// not sideways, so it costs nothing after the turn.
-void prepareArc(int dir) {
-  if (backToWall) return;
+// not sideways. Returns the sideways offset after any shuffle (> 0 = right of centre, NAN =
+// unknown): it tells where along the new corridor the arc will end.
+float prepareArc(int dir) {
   float l, f, r;
   averageAll(l, f, r);
+  float off = lateralOffset(l, r);
+  if (backToWall) return off;
   float outerGap = (dir < 0) ? l : r;  // right turn: rear corner swings toward the left wall
   float innerGap = (dir < 0) ? r : l;
-  if (outerGap >= WALL_THRESHOLD_MM) return;  // no outer wall
+  if (outerGap >= WALL_THRESHOLD_MM) return off;  // no outer wall
   float margin = outerGap + HALF_WIDTH_MM - ARC_OUTER_REACH_MM;
-  if (margin >= ARC_MIN_MARGIN_MM) return;
+  if (margin >= ARC_MIN_MARGIN_MM) return off;
   float shift = ARC_TARGET_MARGIN_MM - margin;
   if (innerGap < WALL_THRESHOLD_MM) shift = min(shift, innerGap - 12.0f);  // don't hit the inner wall
-  if (shift <= SHIFT_TOL_MM) return;
+  if (shift <= SHIFT_TOL_MM) return off;
   shiftSideways(dir < 0 ? -shift : shift, FRONT_GAP_MM);
+  return off + (dir < 0 ? shift : -shift);  // moved right for a right turn
 }
 
 // Before driving straight on from a stop: if the side walls show the robot is well off the
 // corridor centre, shuffle back to it first. (Driving also steers toward the centre, but a big
 // offset at the start of a straight would take most of a cell to remove.) Not against the wall
 // behind (no room to reverse).
-void centreBeforeStraight() {
+// Also used at the first stop after a 90° turn, with a tighter tolerance: whatever the turn
+// left over sideways is taken out there with the side ToFs.
+void centreInCorridor(float tol) {
   if (backToWall) return;
-  bool hasL = lastL < SIDE_FOLLOW_MM, hasR = lastR < SIDE_FOLLOW_MM;
-  float off;  // > 0: robot is right of centre, so move left
-  if (hasL && hasR) off = (lastL - lastR) / 2;
-  else if (hasL) off = lastL - centreGap;
-  else if (hasR) off = centreGap - lastR;
-  else return;
-  if (fabs(off) > CENTRE_TOL_MM) shiftSideways(off, FRONT_GAP_MM);
+  float off = lateralOffset(lastL, lastR);  // > 0: robot is right of centre, so move left
+  if (isnan(off) || fabs(off) <= tol) return;
+  sense();
+  bool front = tofF < FRONT_WALL_THRESHOLD_MM;
+  shiftSideways(off, FRONT_GAP_MM);
+  if (front) carryMm = 0;  // it pulled up to the front wall
+  lastL -= off; lastR += off;  // now centred: don't do it again before a straight
+}
+
+// Drives (forward or back) to the decision point by the encoders, keeping what is left over.
+void driveToDecisionPoint() {
+  float c = carryMm;
+  driveStraight(-c, 90, false, false, NAN);
+  carryMm = (c > 0) ? c - lastMovedMm : c + lastMovedMm;
 }
 
 // Puts the axle on the decision point before a turn: the front wall if there is one,
@@ -1220,9 +1241,8 @@ void settleAtDecisionPoint() {
   if (tofF < FRONT_WALL_THRESHOLD_MM) {
     alignToFrontWall(FRONT_GAP_MM);
     carryMm = 0;
-  } else if (fabs(carryMm) > SETTLE_TOL_MM && !(backToWall && carryMm > 0)) {
-    driveStraight(-carryMm, 90, false, false, NAN);
-    carryMm = 0;
+  } else if ((carryMm < -SETTLE_TOL_MM || carryMm > SETTLE_LATE_TOL_MM) && !(backToWall && carryMm > 0)) {
+    driveToDecisionPoint();
   }
 }
 
@@ -1253,19 +1273,26 @@ bool executeTurn(char move) {
   } else {
     int dir = (move == 'L') ? 1 : -1;
     settleAtDecisionPoint();
-    prepareArc(dir);
+    float e = prepareArc(dir);
     ok = arcTurn(dir);
-    carryMm = TURN_RADIUS_MM + DECISION_BACK_MM;  // arc ends TURN_RADIUS past the cell centre
+    // The arc ends TURN_RADIUS past the cell centre; starting it off centre moves that end
+    // along the new corridor (right of centre: further for a right turn, shorter for a left).
+    if (isnan(e)) e = 0;
+    carryMm = TURN_RADIUS_MM + DECISION_BACK_MM - dir * constrain(e, -25.0f, 25.0f);
     backToWall = false;
+    justTurned = true;
   }
   return ok;
 }
 
 // Drives to the decision point numCells ahead. Returns the cells actually advanced (fewer if a
 // wall the map didn't know about stopped it, or it stalled).
+// Right after a turn it stops POST_TURN_STOP_MM past the decision point, so a short arc can't
+// leave the side ToFs looking at the corner post (that would be read as a side wall).
 uint8_t moveCells(uint8_t numCells, int maxPwm) {
   float carry0 = carryMm;
-  int r = driveStraight(numCells * CELL_MM - carry0, maxPwm, true, true, carry0 - DECISION_BACK_MM);
+  float extra = justTurned ? POST_TURN_STOP_MM : 0;
+  int r = driveStraight(numCells * CELL_MM - carry0 + extra, maxPwm, true, true, carry0 - DECISION_BACK_MM);
   float axle = carry0 + lastMovedMm;  // measured from the start cell's decision point
   int k = (int)round(axle / CELL_MM);
   k = constrain(k, 0, (int)numCells);
@@ -1277,17 +1304,22 @@ uint8_t moveCells(uint8_t numCells, int maxPwm) {
 }
 
 // No front wall before a 90° turn, so the turn point comes from the encoders alone. Check it
-// with the side ToF on the turn side: from the decision point it already looks past the corner
-// post into the opening. If it still sees a wall, the robot is short of the corner: creep on
-// until the opening shows, then on to the decision point. Then go TURN_LATE_MM further, so the
-// turn is never started early. False = no opening at all within OPENING_MAX_CREEP_MM (the robot
-// goes back to where it was).
+// with the side ToF on the turn side (averaged, never one reading): from the decision point it
+// already looks past the corner post into the opening. If it still sees a wall, the robot is
+// short of the corner: creep on until two readings in a row see the opening. The side ToF is
+// then just past the post, which puts the axle a known distance before the decision point.
+// Then drive to TURN_LATE_MM past the decision point (only what is missing). False = no
+// opening within OPENING_MAX_CREEP_MM (the robot goes back to where it was).
 bool approachTurn(int dir) {
-  sense();
-  if ((dir > 0 ? tofL : tofR) < WALL_THRESHOLD_MM) {
+  float l, f, r;
+  averageAll(l, f, r);
+  if ((dir > 0 ? l : r) < WALL_THRESHOLD_MM) {
     resetTicks();
-    while ((dir > 0 ? tofL : tofR) < WALL_THRESHOLD_MM) {
-      if (travelledMm() > OPENING_MAX_CREEP_MM) {
+    uint8_t seq = dir > 0 ? seqL : seqR, open = 0;
+    float edgeAt = 0;
+    unsigned long t0 = millis();
+    while (open < 2) {
+      if (travelledMm() > OPENING_MAX_CREEP_MM || millis() - t0 > OPENING_TIMEOUT_MS) {
         stopMotors();
         senseFor(60);
         driveStraight(-travelledMm(), 90, false, false, NAN);
@@ -1297,14 +1329,23 @@ bool approachTurn(int dir) {
       setMotors((int)(60 - c), (int)(60 + c));
       delay(3);
       sense();
+      uint8_t sq = dir > 0 ? seqL : seqR;
+      if (sq != seq) {
+        seq = sq;
+        if ((dir > 0 ? tofL : tofR) >= WALL_THRESHOLD_MM) { if (open++ == 0) edgeAt = travelledMm(); }
+        else open = 0;
+      }
     }
     stopMotors();
     senseFor(40);
-    // The side ToF has just passed the corner post: the decision point is this much further on.
-    driveStraight(HALF_CORRIDOR_MM - EDGE_BEAM_MM + SIDE_TOF_AHEAD_MM - DECISION_BACK_MM, 90, false, false, NAN);
+    // Where the opening started the axle was this far before the decision point.
+    carryMm = -(HALF_CORRIDOR_MM - EDGE_BEAM_MM + SIDE_TOF_AHEAD_MM - DECISION_BACK_MM) + (travelledMm() - edgeAt);
   }
-  if (TURN_LATE_MM > 0) driveStraight(TURN_LATE_MM, 90, false, false, NAN);
-  carryMm = 0;  // this is the turn point now
+  if (carryMm < TURN_LATE_MM - 2) {
+    float c = carryMm;
+    driveStraight(TURN_LATE_MM - c, 90, false, false, NAN);
+    carryMm = c + lastMovedMm;
+  }
   return true;
 }
 
@@ -1330,11 +1371,10 @@ uint8_t readWalls(float &l, float &f, float &r) {
 
 // Which of the three readings are clear-cut (bits as readWalls): far enough from the
 // wall / no-wall threshold that they can't be a borderline misread.
+__attribute__((noinline)) bool sureSide(float v) { return v < SIDE_SURE_WALL_MM || v > SIDE_SURE_OPEN_MM; }
 uint8_t sureWalls(float l, float f, float r) {
-  float frontLimit = FRONT_WALL_THRESHOLD_MM - carryMm;
-  return (l < SIDE_SURE_WALL_MM || l > SIDE_SURE_OPEN_MM)
-       | ((f < frontLimit - FRONT_SURE_MARGIN_MM || (f > frontLimit + FRONT_SURE_MARGIN_MM && f < 999)) << 1)
-       | ((r < SIDE_SURE_WALL_MM || r > SIDE_SURE_OPEN_MM) << 2);
+  float d = fabs(f - (FRONT_WALL_THRESHOLD_MM - carryMm));
+  return sureSide(l) | ((d > FRONT_SURE_MARGIN_MM && f < 999) << 1) | (sureSide(r) << 2);
 }
 
 // Reads the three walls of the current cell from its decision point, at every stop, and puts
@@ -1346,6 +1386,10 @@ uint8_t sureWalls(float l, float f, float r) {
 //  * two side walls give the side reading when centred.
 void senseWallsHere() {
   float l, f, r, l2, f2, r2;
+  // Well short of the decision point with nothing in front: the side ToFs could still be
+  // looking at the post behind, so close the gap before reading.
+  sense();
+  if (carryMm < -12 && !backToWall && tofF >= FRONT_WALL_THRESHOLD_MM) driveToDecisionPoint();
   uint8_t walls = readWalls(l, f, r);
   uint8_t sure = sureWalls(l, f, r);
   if (showsRightCorner(walls)) walls |= readWalls(l2, f2, r2);  // an opening counts only if both readings see it
@@ -1388,7 +1432,7 @@ bool loadMaze() {
   cornerKnown = EEPROM.read(addr++);
   longSide = EEPROM.read(addr++);
   if (EEPROM.read(addr) == 1) {
-    Serial.println(F("\n!!! Restarted while driving (switched off, battery dip, or Serial Monitor opened). Map kept."));
+    Serial.println(F("\n!! Restarted mid-run (power off/dip or Serial Monitor)"));
     EEPROM.update(addr, 0);  // reported once
   }
   return (startX == 0 || startX == MAZE_W - 1) && longSide <= 2;
@@ -1426,10 +1470,12 @@ uint16_t ramNeverUsed() {
 // size, and every cell byte in hex (row 0 first, left to right). Paste the Serial Monitor
 // output into the Maze Map Viewer page to draw it.
 void printMap() {
+#if LONG_SIDE != 0
+  const int8_t w = MAZE_W, h = MAZE_H;  // the map is exactly the maze
+#else
   int8_t w = (longSide == 2) ? MAZE_SHORT : (longSide == 1) ? MAZE_LONG : MAZE_W;
   int8_t h = (longSide == 1) ? MAZE_SHORT : (longSide == 2) ? MAZE_LONG : MAZE_H;
-  if (w > MAZE_W) w = MAZE_W;
-  if (h > MAZE_H) h = MAZE_H;
+#endif
   int8_t x0 = (startX == 0) ? 0 : startX - w + 1;
   static const char arrow[4] = { '^', '>', 'v', '<' };
   uint8_t mapped = 0;
@@ -1462,13 +1508,11 @@ void printMap() {
   for (int8_t x = 0; x < w; x++) Serial.print(F("+---"));
   Serial.println('+');
   Serial.print(F("Mapped ")); Serial.print(mapped); Serial.print('/'); Serial.print(w * h);
-  Serial.print(F(" cells. Robot (")); Serial.print(posX - x0); Serial.print(',');
-  Serial.print(posY); Serial.print(F(") facing ")); Serial.print("NESW"[facing]);
   Serial.print(F(". Speed run ")); Serial.print(speedRunReady() ? F("ready") : F("not yet"));
-  Serial.print(F(". RAM never used: ")); Serial.print(ramNeverUsed()); Serial.println(F(" bytes"));
-  Serial.print(F("DATA:")); Serial.print(w); Serial.print(','); Serial.print(h); Serial.print(',');
-  Serial.print(startX - x0); Serial.print(','); Serial.print(posX - x0); Serial.print(','); Serial.print(posY); Serial.print(','); Serial.print(facing);
-  Serial.print(','); Serial.print(GOAL_SIZE); Serial.print(',');
+  Serial.print(F(". Free RAM ")); Serial.println(ramNeverUsed());
+  Serial.print(F("DATA:"));
+  uint8_t head[7] = { (uint8_t)w, (uint8_t)h, (uint8_t)(startX - x0), (uint8_t)(posX - x0), (uint8_t)posY, facing, GOAL_SIZE };
+  for (uint8_t i = 0; i < 7; i++) { Serial.print(head[i]); Serial.print(','); }
   for (int8_t y = 0; y < h; y++)
     for (int8_t x = x0; x < x0 + w; x++) {
       if (maze[x][y] < 0x10) Serial.print('0');
@@ -1555,7 +1599,7 @@ bool pauseAndRedo() {
   }
   waitingForButton = true;
   saveMaze();  // not driving now: switching off while paused is not reported as a reset
-  Serial.println(F("\nPAUSED: put it in the arrow's cell, facing the arrow, press. Long = end."));
+  Serial.println(F("\nPAUSED: put it in the arrow cell, press. Long=end"));
   printMap();
   blink(2);
   digitalWrite(STATUS_LED, HIGH);
@@ -1570,12 +1614,13 @@ bool pauseAndRedo() {
     return false;
   }
   delay(500);  // let go of the robot
-  recalGyroBias();                        // standing still: re-measure the gyro
+  recalGyroBias(100);                        // standing still: re-measure the gyro
   targetHeading = -90.0f * facing;        // put back square, facing `facing`
   absoluteHeading = targetHeading;
   carryMm = DECISION_BACK_MM;             // in the middle of the cell
   backToWall = false;
   atCentre = true;
+  justTurned = false;
   odoMm = 0;
   resetFits();
   return true;
@@ -1591,6 +1636,7 @@ void beginRun(uint8_t firstPhase) {
   putWall(startX, 0, 2, true);
   pauseRequested = false;
   atCentre = false;
+  justTurned = false;
   failX = -1;
   phase = firstPhase;
   runState = ST_RUN;
@@ -1632,6 +1678,8 @@ void runStep() {
   tryDir = dir;
 
   char move = relMove(facing, dir);
+  if (justTurned && phase != PH_FAST && !atCentre && move != 'U') centreInCorridor(POST_TURN_TOL_MM);
+  justTurned = false;
   if ((move == 'L' || move == 'R') && !atCentre) {
     settleAtDecisionPoint();
     sense();
@@ -1641,7 +1689,7 @@ void runStep() {
       return;
     }
   }
-  if (move == 'S' && phase != PH_FAST && !atCentre) centreBeforeStraight();
+  if (move == 'S' && phase != PH_FAST && !atCentre) centreInCorridor(CENTRE_TOL_MM);
   bool turned = executeTurn(move);
   facing = dir;
   if (!turned || pauseRequested) { pauseAndRedo(); return; }
