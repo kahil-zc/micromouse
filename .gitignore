@@ -6,3 +6,5 @@ tests/maze_5x10_section.inc
 tests/micromouse_5x10_sim
 tests/maze_17_section.inc
 tests/micromouse_17_sim
+tests/maze_18_section.inc
+tests/micromouse_18_sim
