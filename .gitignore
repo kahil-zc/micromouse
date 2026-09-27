@@ -34,3 +34,5 @@ tests/maze28.inc
 tests/sim28
 tests/maze29.inc
 tests/sim29
+tests/maze30.inc
+tests/sim30
