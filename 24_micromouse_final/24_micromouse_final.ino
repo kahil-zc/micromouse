@@ -12,8 +12,15 @@
 // ║    short press = SEARCH if no route is known yet, else SPEED RUN ║
 // ║    long press (1 s, LED on) = SEARCH again (keeps the map)       ║
 // ║    double click, or held while powering on = forget the map      ║
-// ║  During a run: a press, a crash or getting stuck = PAUSE: the    ║
-// ║  LED blinks twice and stays on. Put the robot in the middle of   ║
+// ║  During a run, something wrong = PAUSE: the LED blinks SLOWLY a  ║
+// ║  number of times, then stays on. The number says why:            ║
+// ║    1 = you pressed the button                                    ║
+// ║    2 = front ToF closer than 20 mm (about to crash)              ║
+// ║    3 = stuck (wheels not turning for 0.5 s)                      ║
+// ║    4 = a turn didn't finish in 3 s (hit something)               ║
+// ║  5 quick blinks = reached the goal. At power-on, 10 very quick   ║
+// ║  blinks = the Nano restarted while driving (power: battery or    ║
+// ║  motor current), not the program. Put the robot in the middle of ║
 // ║  the cell shown by the arrow on the map (the cell it was in when ║
 // ║  it last stopped), facing the way the arrow points, and press:   ║
 // ║  it carries on from there. Long press instead = end the run.     ║
@@ -39,7 +46,7 @@
 // ║                                                                  ║
 // ║  Also from the ToFs: after every turn it checks it's centred in  ║
 // ║  the corridor (side ToFs) and shuffles back if it's more than    ║
-// ║  6 mm off; before a straight, if more than 12 mm off.            ║
+// ║  10 mm off; before a straight, if more than 12 mm off.            ║
 // ║                                                                  ║
 // ║  USB (Serial Monitor, 115200): the map is printed at the goal,   ║
 // ║  at home and at every pause; send 'm' while it waits to print it ║
@@ -208,18 +215,24 @@
 #define GYRO_CALIB_SAMPLES  200
 #define LONG_PRESS_MS       1000
 #define DOUBLE_CLICK_MS     400    // second press within this = double click
-#define BUTTON_PAUSE_COUNT  5      // button must read pressed this many times in a row to pause
+#define BUTTON_PAUSE_MS     150    // button must be held this long to pause a run (noise can't)
 #define SENSE_MS            150    // how long to average the ToFs when reading the walls
 #define AHEAD_TOL_MM        50     // a wall one cell ahead reads FRONT_GAP + 180, give or take this
 #define FRONT_FIX_MAX_MM    40.0f  // trust that wall for the position only this close to the encoders
 #define CENTRE_TOL_MM       12.0f  // before a straight, shuffle to the corridor centre if this far off
-#define POST_TURN_TOL_MM     6.0f  // after a turn, shuffle to the corridor centre if this far off
+#define POST_TURN_TOL_MM    10.0f  // after a turn, shuffle to the corridor centre if this far off
 #define EEPROM_MAGIC        (0xC0 ^ MAP_W ^ (MAP_H << 4) ^ GOAL_SIZE)
 
 #define DRIVE_STALL 0
 #define DRIVE_DONE  1
 #define DRIVE_WALL  2
 #define DRIVE_CRASH 3   // front closer than FRONT_EMERGENCY_MM
+
+#define WHY_BUTTON   1   // pause reasons = number of slow blinks
+#define WHY_CRASH    2
+#define WHY_STUCK    3
+#define WHY_TURN     4
+#define EE_LOG     200  // EEPROM: last pause reason, x, y, facing, pauses this run, run flag
 
 #define TURN_OK      0
 #define TURN_FAILED  1
@@ -254,6 +267,7 @@ uint16_t cntL = 0, cntF = 0, cntR = 0;
 float carryMm = 0;                // axle position past this cell's decision point
 float lastOvershootMm = 0;
 float lastMovedMm = 0;            // distance of the last driveStraight, with edge corrections
+int lastDriveResult = 0;          // DRIVE_... of the last moveCells
 float odoMm = 0;                  // distance driven straight since the last turn
 bool backToWall = false;          // rear is against a wall: never reverse
 bool atCentre = false;            // put back by hand in the middle of a cell (after a pause)
@@ -263,7 +277,7 @@ float turnSideMm = 999;           // side reading toward the turn, just before a
 
 int runState = ST_WAIT;
 bool pauseRequested = false;      // button pressed during a run
-uint8_t buttonLowCount = 0;       // sense() calls in a row with the button down
+unsigned long buttonDownSince = 0; // when the button went down (0 = up)
 uint8_t frontCloseCount = 0;      // front readings in a row under FRONT_EMERGENCY_MM
 
 VL53L0X sensorLeft;
@@ -630,15 +644,16 @@ void updateToF() {
 }
 
 // Called in every loop: keeps the gyro integrating and the ToF values fresh.
-// The button only sets a flag (pressed for several calls in a row, so motor noise can't); the
-// robot pauses when the current move ends.
+// The button only sets a flag (held down BUTTON_PAUSE_MS without a break, so motor noise on the
+// wire can't); the robot pauses when the current move ends.
 void sense() {
   updateGyro();
   updateToF();
   if (runState != ST_WAIT && digitalRead(START_BUTTON) == LOW) {
-    if (++buttonLowCount >= BUTTON_PAUSE_COUNT) pauseRequested = true;
+    if (!buttonDownSince) buttonDownSince = millis() | 1;
+    else if (millis() - buttonDownSince > BUTTON_PAUSE_MS) pauseRequested = true;
   } else {
-    buttonLowCount = 0;
+    buttonDownSince = 0;
   }
 }
 
@@ -1064,6 +1079,7 @@ int moveCells(int numCells, int maxPwm) {
   float carry0 = carryMm;
   int r = driveStraight(numCells * CELL_MM - carry0, maxPwm, true, true, carry0 - DECISION_BACK_MM);
   backToWall = false;
+  lastDriveResult = r;
   if (r == DRIVE_STALL || r == DRIVE_CRASH) return -1;
   float axle = carry0 + lastMovedMm;  // from the start cell's decision point
   int k = constrain((int)round(axle / CELL_MM), 0, numCells);
@@ -1199,20 +1215,42 @@ void blink(uint8_t times) {
 // blink twice, LED on, and wait to be put back in the middle of the cell it last stopped in
 // (posX, posY), facing `facing`. Short press = carry on from there, long press = end the run.
 // Nothing from the failed move went into the map.
-void pauseForHelp() {
+// Prints why the robot last paused (kept in EEPROM, so it survives switching off).
+void printLastPause() {
+  uint8_t why = EEPROM.read(EE_LOG);
+  if (why < 1 || why > 4) return;
+  Serial.print(F("Last pause: "));
+  Serial.print(why == WHY_BUTTON ? F("button") : why == WHY_CRASH ? F("front closer than 20 mm")
+               : why == WHY_STUCK ? F("stuck") : F("turn timeout"));
+  Serial.print(F(" in cell (")); Serial.print(EEPROM.read(EE_LOG + 1)); Serial.print(',');
+  Serial.print(EEPROM.read(EE_LOG + 2)); Serial.print(F(") facing ")); Serial.print("NESW"[EEPROM.read(EE_LOG + 3) & 3]);
+  Serial.print(F(". Pauses that run: ")); Serial.println(EEPROM.read(EE_LOG + 4));
+}
+
+void pauseForHelp(uint8_t why) {
   stopMotors();
   while (digitalRead(START_BUTTON) == LOW);
   delay(50);
   saveMaze();
+  EEPROM.update(EE_LOG, why);
+  EEPROM.update(EE_LOG + 1, posX); EEPROM.update(EE_LOG + 2, posY); EEPROM.update(EE_LOG + 3, facing);
+  EEPROM.update(EE_LOG + 4, EEPROM.read(EE_LOG + 4) + 1);
+  EEPROM.update(EE_LOG + 5, 0);  // not driving: switching off now is not a "restart while driving"
   Serial.println(F("\nPAUSED: put it in the arrow's cell, middle, facing the arrow. Press = go on, long = end."));
+  printLastPause();
   printMaze();
-  blink(2);
+  delay(400);
+  for (uint8_t i = 0; i < why; i++) {  // slow, countable: the number = why
+    digitalWrite(STATUS_LED, HIGH); delay(300); digitalWrite(STATUS_LED, LOW); delay(300);
+  }
+  delay(400);
   digitalWrite(STATUS_LED, HIGH);
   int b;
   do { b = readButton(); } while (b == 0);
   pauseRequested = false;
   frontCloseCount = 0;
   if (b != 1) { runState = ST_WAIT; return; }
+  EEPROM.update(EE_LOG + 5, 1);  // driving again
   delay(500);  // let go of the robot
   recalGyroBias();
   targetHeading = -90.0f * facing;  // + = left, so east (1) is -90
@@ -1236,6 +1274,9 @@ void beginRun(int state) {
   atCentre = false;
   justTurned = false;
   lastL = lastR = 999;
+  EEPROM.update(EE_LOG, 0);
+  EEPROM.update(EE_LOG + 4, 0);
+  EEPROM.update(EE_LOG + 5, 1);  // driving: a restart before this is cleared = power problem
   runState = state;
 }
 
@@ -1248,8 +1289,10 @@ void finishAtHome() {
   facing = 0;
   startAlignment();
   saveMaze();
+  EEPROM.update(EE_LOG + 5, 0);
   printMaze();
   reportPath();
+  printLastPause();
   Serial.println(F("\nHOME. Press = speed run, long press = search again."));
   runState = ST_WAIT;
 }
@@ -1268,22 +1311,22 @@ bool doMove(uint8_t d, int n, int pwm) {
     setWall(posX, posY, d, true);
     return true;
   }
-  if (t != TURN_OK) { pauseForHelp(); return false; }  // turn failed: still facing the old way
+  if (t != TURN_OK) { pauseForHelp(pauseRequested ? WHY_BUTTON : WHY_TURN); return false; }  // turn failed: still facing the old way
   facing = d;
-  if (pauseRequested) { pauseForHelp(); return false; }
+  if (pauseRequested) { pauseForHelp(WHY_BUTTON); return false; }
   int k = moveCells(n, pwm);
   atCentre = false;
-  if (k < 0) { pauseForHelp(); return false; }  // stuck or about to crash: last stop, facing d
+  if (k < 0) { pauseForHelp(lastDriveResult == DRIVE_CRASH ? WHY_CRASH : WHY_STUCK); return false; }  // stuck or about to crash: last stop, facing d
   advance(d, k);
   if (k < n) setWall(posX, posY, d, true);  // the front ToF found a wall the map didn't have
-  if (pauseRequested) { pauseForHelp(); return false; }  // stopped in the new cell: resume there
+  if (pauseRequested) { pauseForHelp(WHY_BUTTON); return false; }  // stopped in the new cell: resume there
   return true;
 }
 
 // One cell of a search: read walls, flood, turn toward the lowest neighbour, drive one cell.
 void searchStep(bool toGoal) {
   senseWallsHere();
-  if (pauseRequested) { pauseForHelp(); return; }
+  if (pauseRequested) { pauseForHelp(WHY_BUTTON); return; }
   uint8_t d = nextDir(toGoal);
   if (d == 255) {
     Serial.println(F("No route - a wall was misread. Reading them again."));
@@ -1322,24 +1365,6 @@ void fastStep() {
   doMove(d, straightRun(posX, posY, d, true), SPEED_RUN_PWM);
 }
 
-void printGeometryCheck() {
-  float arcOuter = HALF_CORRIDOR_MM - ARC_OUTER_REACH_MM;
-  float arcFront = HALF_CORRIDOR_MM - (sqrt(sq(TURN_RADIUS_MM + HALF_WIDTH_MM) + sq(AXLE_TO_FRONT_MM)) - DECISION_BACK_MM);
-  float uTurnSide = (2 * HALF_CORRIDOR_MM - SPIN_R_REAR_MM - SPIN_R_FRONT_MM) / 2;
-
-  Serial.println(F("\n--- GEOMETRY CHECK ---"));
-  Serial.print(F("Side reading when centred:        ")); Serial.println(SIDE_GAP_MM);
-  Serial.print(F("Front reading, axle at centre:    ")); Serial.println(HALF_CORRIDOR_MM - AXLE_TO_FRONT_MM);
-  Serial.print(F("Front reading at decision point:  ")); Serial.println(FRONT_GAP_MM);
-  Serial.print(F("Front reading for U-turns:        ")); Serial.println(U_TURN_FRONT_GAP_MM);
-  Serial.print(F("Arc turn clearance, outer wall:   ")); Serial.println(arcOuter);
-  Serial.print(F("Arc turn clearance, front wall:   ")); Serial.println(arcFront);
-  Serial.print(F("U-turn clearance per side:        ")); Serial.println(uTurnSide);
-  Serial.print(F("Arc inner/outer wheel ratio:      ")); Serial.println(ARC_RATIO);
-  if (arcOuter < 6 || arcFront < 6) Serial.println(F("WARNING: arc turns are tight - raise TURN_RADIUS_MM"));
-  if (uTurnSide < 2) Serial.println(F("WARNING: U-turns cannot clear the walls - shorten the rear overhang"));
-}
-
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
@@ -1362,7 +1387,6 @@ void setup() {
   initToFSensors();
   initMPU6050();
   calibrateGyro();
-  printGeometryCheck();
 
   if (digitalRead(START_BUTTON) == LOW) {
     initMaze();
@@ -1379,6 +1403,12 @@ void setup() {
     initMaze();
   }
 
+  if (EEPROM.read(EE_LOG + 5) == 1) {
+    EEPROM.update(EE_LOG + 5, 0);
+    Serial.println(F("\n!!! The Nano RESTARTED while driving: power (battery low, or motor current dip), not the program."));
+    for (uint8_t i = 0; i < 10; i++) { digitalWrite(STATUS_LED, HIGH); delay(40); digitalWrite(STATUS_LED, LOW); delay(40); }
+  }
+  printLastPause();
   Serial.println(F("\n=== MICROMOUSE 24 ==="));
   Serial.println(F("Press = search (speed run once a route is known), long = search, double = clear map, 'm' = map."));
 }
@@ -1395,7 +1425,7 @@ void loop() {
       Serial.print(F("  F ")); Serial.print(tofF);
       Serial.print(F("  R ")); Serial.println(tofR);
     }
-    if (Serial.available() && Serial.read() == 'm') { printMaze(); reportPath(); }
+    if (Serial.available() && Serial.read() == 'm') { printMaze(); reportPath(); printLastPause(); }
     int b = readButton();
     if (b == 3) {
       initMaze();
