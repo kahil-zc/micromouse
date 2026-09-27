@@ -705,14 +705,6 @@ float headingCorrection(bool useWalls) {
   return KP * (desired - absoluteHeading) - KD * gyroRate;
 }
 
-// --- SIDE-WALL EDGE CORRECTION ---
-// Posts sit on every cell boundary. When a side reading changes between wall and gap, the side
-// sensor is at a known spot (a post edge), which fixes the distance driven so far.
-// --- GYRO CORRECTION FROM SIDE WALLS ---
-// While a side wall is present, the reading against distance driven is a straight line whose
-// slope is the robot's real angle to the corridor. Comparing that with the gyro's angle over
-// the same stretch shows how far the gyro has drifted (turn scale error, bias drift), and the
-// gyro is pulled back a little each time. Fits carry on across stops until the robot turns.
 // --- MOVEMENT BEHAVIOURS ---
 // Drives distMm (negative = reverse) holding targetHeading.
 //  center:      steer toward the corridor centre using the side walls
