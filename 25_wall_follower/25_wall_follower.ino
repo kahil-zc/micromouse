@@ -181,10 +181,7 @@
 #define DOUBLE_CLICK_MS     400    // second press within this = double click
 #define BUTTON_PAUSE_MS     150    // button must be held this long to pause a run (noise can't)
 #define SENSE_MS            150    // how long to average the ToFs when reading the walls
-#define AHEAD_TOL_MM        50     // a wall one cell ahead reads FRONT_GAP + 180, give or take this
 #define FRONT_FIX_MAX_MM    40.0f  // trust that wall for the position only this close to the encoders
-#define CENTRE_TOL_MM       12.0f  // before a straight, shuffle to the corridor centre if this far off
-#define POST_TURN_TOL_MM    10.0f  // after a turn, shuffle to the corridor centre if this far off
 #define EEPROM_MAGIC        0xA5   // marks a saved route in EEPROM
 
 #define DRIVE_STALL 0
