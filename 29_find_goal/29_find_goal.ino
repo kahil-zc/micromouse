@@ -21,7 +21,8 @@
 // ║  button while switching on also wipes the saved map.             ║
 // ║                                                                  ║
 // ║  Button (START), robot in the start cell, back to the wall:      ║
-// ║    short press = SEARCH       long press (1 s, LED on) = FAST RUN ║
+// ║    short press = SEARCH                                          ║
+// ║    long press (1 s, LED on) = FAST RUN                           ║
 // ║    held during a search = give up and drive home                 ║
 // ║  LED: 5 quick blinks = goal room found / reached. LED stays on   ║
 // ║  = 3 failed moves in a row: put it in the start cell, press.     ║
@@ -29,11 +30,12 @@
 // ║  USB (115200): it prints only the map (when it finds the goal    ║
 // ║  and when it gets home) and real problems. While it waits:       ║
 // ║  L F R readings with failed-reading counts ("L 35/0"); send 'm'  ║
-// ║  to print the map. Map: ### wall, . unseen, ? not visited,       ║
-// ║  S start, G goal room, ^ > v < robot.                            ║
+// ║  to print the map. Map: --- and | = wall, . = not seen yet,      ║
+// ║  ? = not visited, S = start, G = goal room, ^ > v < = robot.     ║
 // ║                                                                  ║
 // ║  ToF readings: failed measurements (sensor status, or 0 mm) are  ║
-// ║  thrown away; the emergency stop needs 2 close readings in a row.║
+// ║  thrown away; the emergency stop needs 2 close readings in a     ║
+// ║  row.                                                            ║
 // ║  A wall the map didn't have (front ToF, or the side ToF just     ║
 // ║  before a turn) is written down and it chooses again.            ║
 // ║                                                                  ║
