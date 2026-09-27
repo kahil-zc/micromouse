@@ -10,7 +10,7 @@ B=build
 mkdir -p $B
 {
   sed -n '/^\/\/ --- MAZE CONFIG/,/^\/\/ --- END MAZE CONFIG ---/p' $INO
-  grep -E '^#define (ST_[A-Z]+|SEARCH_PASSES) ' $INO
+  grep -E '^#define (ST_[A-Z_]+|SEARCH_PASSES) ' $INO
 } > $B/maze_config.h
 for v in MAP_SIZE START_X START_Y PULL_RIGHT PULL_AHEAD UTURN_COST; do
   if [ -n "${!v}" ]; then sed -i "s/^#define $v .*/#define $v ${!v}/" $B/maze_config.h; fi

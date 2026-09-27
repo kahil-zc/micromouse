@@ -1,8 +1,8 @@
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  31_find_goal                                                    ║
 // ║  Finds the goal room in a maze of unknown shape and size.        ║
-// ║  All driving and turning is 14_floodfill_final's (see "What      ║
-// ║  changed from 14" below for the three small differences).        ║
+// ║  All driving, turning and settings are 14_floodfill_final's,     ║
+// ║  unchanged. Only the search, the map and the saving are new.     ║
 // ║                                                                  ║
 // ║  THE GOAL = a 2x2 room (36 x 36 cm) with no walls inside it.     ║
 // ║  A maze has no other open 2x2, so once the robot has seen the 4  ║
@@ -42,15 +42,6 @@
 // ║  (SHOW_MAP_EACH_CELL). Map: --- and | = wall, . = not seen,      ║
 // ║  ? = not visited, S = start, G = goal room, T = target,          ║
 // ║  ^ > v < = robot.                                                ║
-// ║                                                                  ║
-// ║  What changed from 14 in the driving:                            ║
-// ║   * A U-turn with no wall in front spins at the cell centre, not ║
-// ║     at the decision point: there the long rear clipped the posts ║
-// ║     at the cell's back corners (84 mm away, rear swings 93 mm).  ║
-// ║   * moveCells() says how many cells it really drove, so a wall   ║
-// ║     the map didn't have can't put the robot in the wrong cell.   ║
-// ║   * The button must be held 150 ms to stop a search (motor noise ║
-// ║     on the wire can't).                                          ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 #include <Wire.h>
@@ -196,7 +187,6 @@
 #define GYRO_CALIB_SAMPLES  200
 #define MAX_FAILS           3      // consecutive failed moves before giving up
 #define LONG_PRESS_MS       1000
-#define BUTTON_HOLD_MS      150    // button must be held this long to stop a search
 #define SEARCH_PASSES       2      // explored everything without finding the room: clear, look again
 #define EEPROM_MAGIC        0x31   // marks a saved map in EEPROM (layout of this sketch)
 
@@ -205,8 +195,8 @@
 #define DRIVE_WALL  2
 
 #define ST_WAIT         0
-#define ST_SEARCH       1   // to the goal room: explore until found, or the shortest way if known
-#define ST_HOME         2   // driving home, reading walls in new cells
+#define ST_SEARCH_GOAL  1   // to the goal room: explore until found, or the shortest way if known
+#define ST_SEARCH_HOME  2   // driving home, reading walls in new cells
 #define ST_FAST         3   // fast run to the goal room on known walls
 
 #if MAP_SIZE > 22
@@ -238,7 +228,6 @@ int failCount = 0;
 
 int runState = ST_WAIT;
 bool abortExploration = false;
-unsigned long buttonDownSince = 0; // when the button went down during a search (0 = up)
 uint8_t searchPass = 0;           // times it has explored everything without finding the room
 
 VL53L0X sensorLeft;
@@ -489,12 +478,12 @@ uint8_t shortestPath(bool knownOnly) {
 // What a search (or the way home) does next, from the robot's cell. NEXT_MOVE: drive planDir
 // for planRun cells.
 #define NEXT_MOVE       0
-#define NEXT_AT_HOME    1   // in the start cell (ST_HOME)
-#define NEXT_AT_GOAL    2   // in the known goal room (ST_SEARCH)
+#define NEXT_AT_HOME    1   // in the start cell (ST_SEARCH_HOME)
+#define NEXT_AT_GOAL    2   // in the known goal room (ST_SEARCH_GOAL)
 #define NEXT_EXPLORED   3   // no unvisited cell it can reach and still no room
 #define NEXT_NO_WAY     4   // misread walls close every way: they have been forgotten, ask again
 uint8_t nextStep(uint8_t state) {
-  if (state == ST_HOME) {
+  if (state == ST_SEARCH_HOME) {
     if (posX == START_X && posY == START_Y) return NEXT_AT_HOME;
     if (plan(TO_START, false)) return NEXT_MOVE;
   } else if (goalX >= 0) {
@@ -643,17 +632,11 @@ void updateToF() {
 }
 
 // Called in every loop: keeps the gyro integrating and the ToF values fresh.
-// The button only sets a flag (held down BUTTON_HOLD_MS without a break, so motor noise on the
-// wire can't); the current cell always finishes first.
+// The button only sets a flag; the current cell always finishes first.
 void sense() {
   updateGyro();
   updateToF();
-  if (runState == ST_SEARCH && digitalRead(START_BUTTON) == LOW) {
-    if (!buttonDownSince) buttonDownSince = millis() | 1;
-    else if (millis() - buttonDownSince > BUTTON_HOLD_MS) abortExploration = true;
-  } else {
-    buttonDownSince = 0;
-  }
+  if (runState == ST_SEARCH_GOAL && digitalRead(START_BUTTON) == LOW) abortExploration = true;
 }
 
 void senseFor(unsigned long ms) {
@@ -756,7 +739,10 @@ void edgeUpdate(SideEdge &e, int tof, float done, float &corrMm, float startAxle
   float k = round((sensorY - CELL_MM / 2 - edgeRel) / CELL_MM);
   float trueY = k * CELL_MM + CELL_MM / 2 + edgeRel;
   float c = trueY - sensorY;
-  if (fabs(c) < EDGE_MAX_CORR_MM) corrMm += c;
+  if (fabs(c) < EDGE_MAX_CORR_MM) {
+    corrMm += c;
+    Serial.print(side); Serial.print(F(" edge, distance corrected by ")); Serial.println(c);
+  }
 }
 
 // --- GYRO CORRECTION FROM SIDE WALLS ---
@@ -787,6 +773,7 @@ void fitUpdate(WallFit &f, int tof, float x, int sideSign) {
     if (fabs(err) < 8) {  // larger means a bad fit (post, open cell), not drift
       float step = constrain(err * HEADING_TRIM_GAIN, -MAX_TRIM_STEP_DEG, MAX_TRIM_STEP_DEG);
       absoluteHeading -= step;
+      Serial.print(F("Gyro corrected from wall by ")); Serial.println(-step);
     }
   }
   f.n = 0;
@@ -1081,19 +1068,14 @@ bool executeTurn(char move) {
   if (move == 'U') {
     sense();
     bool deadEnd = tofF < FRONT_WALL_THRESHOLD_MM;
-    if (!deadEnd) {
-      // No wall ahead: spin with the axle on the cell centre. At the decision point the rear
-      // corners would clip the posts at the back corners of the cell.
-      float toCentre = DECISION_BACK_MM - carryMm;
-      if (fabs(toCentre) > 5 && !(backToWall && toCentre < 0)) driveStraight(toCentre, 90, false, false, NAN);
-    }
+    if (!deadEnd) settleAtDecisionPoint();
     ok = spinSafely(180.0f);
     if (deadEnd) {
       // Turned U_TURN_FRONT_GAP from the dead-end wall, which is now behind: back into it.
       carryMm = (U_TURN_FRONT_GAP_MM + AXLE_TO_FRONT_MM - HALF_CORRIDOR_MM) + DECISION_BACK_MM;
       if (ok) squareOnBackWall();
     } else {
-      carryMm = DECISION_BACK_MM;  // turned on the cell centre
+      carryMm = 2 * DECISION_BACK_MM;  // turned on the decision point
     }
   } else {
     int dir = (move == 'L') ? 1 : -1;
@@ -1106,19 +1088,14 @@ bool executeTurn(char move) {
   return ok;
 }
 
-// Drives to the decision point numCells ahead. Returns the cells really driven: fewer if the
-// front ToF found a wall the map didn't have (result in lastDriveResult).
-int lastDriveResult = DRIVE_DONE;
-int moveCells(int numCells, int maxPwm) {
+// Drives to the decision point numCells ahead.
+bool moveCells(int numCells, int maxPwm) {
   Serial.print(F("Forward cells: ")); Serial.println(numCells);
   float startAxle = carryMm - DECISION_BACK_MM;
   int r = driveStraight(numCells * CELL_MM - carryMm, maxPwm, true, true, startAxle);
-  lastDriveResult = r;
-  float axle = numCells * CELL_MM + lastOvershootMm;  // from this cell's decision point
-  int k = constrain((int)round(axle / CELL_MM), 0, numCells);
-  carryMm = (r == DRIVE_WALL) ? 0 : axle - k * CELL_MM;
+  carryMm = (r == DRIVE_WALL) ? 0 : lastOvershootMm;
   backToWall = false;
-  return k;
+  return r != DRIVE_STALL;
 }
 
 void startAlignment() {
@@ -1284,17 +1261,26 @@ void finishAtHome() {
   runState = ST_WAIT;
 }
 
-// Turns to d and drives up to n cells; updates the position with the cells really driven.
-// True = it got at least one cell on. If the front ToF stopped it early, that wall goes on the
-// map.
+// Turns to d and drives up to n cells with 14's executeTurn / moveCells, then works out from
+// the distance driven how many cells it really got (only bookkeeping, the driving is 14's).
+// True = it got at least one cell on. If the front ToF stopped it early (a wall the map
+// didn't have), that wall goes on the map and wallStop is set.
+bool wallStop = false;
 bool driveTo(uint8_t d, int n, int pwm) {
+  wallStop = false;
   noteResult(executeTurn(relMove(facing, d)));
   facing = d;
   if (runState == ST_WAIT) return false;
-  int k = moveCells(n, pwm);
-  noteResult(lastDriveResult != DRIVE_STALL);
+  bool ok = moveCells(n, pwm);
+  noteResult(ok);
+  float axle = n * CELL_MM + lastOvershootMm;  // driven from this cell's decision point
+  int k = constrain((int)round(axle / CELL_MM), 0, n);
+  if (k < n) {
+    if (ok) wallStop = true;                   // stopped by the front ToF
+    else carryMm = axle - k * CELL_MM;         // stalled: carry relative to the cell it is in
+  }
   moved(d, k);
-  if (k < n && lastDriveResult == DRIVE_WALL) setWall(posX, posY, d, true);  // wall the map didn't have
+  if (wallStop) setWall(posX, posY, d, true);  // wall the map didn't have
   return k > 0;
 }
 
@@ -1306,21 +1292,21 @@ void searchStep() {
     Serial.println(F("\n*** GOAL ROOM FOUND *** heading home"));
     printMaze();
     blink5();
-    runState = ST_HOME;
+    runState = ST_SEARCH_HOME;
   }
   saveMaze();
   bool shown = false;
   while (runState != ST_WAIT) {
-    if (runState == ST_SEARCH && abortExploration) {
+    if (runState == ST_SEARCH_GOAL && abortExploration) {
       Serial.println(F("Search stopped - heading home"));
-      runState = ST_HOME;
+      runState = ST_SEARCH_HOME;
     }
     uint8_t next = nextStep(runState);
     if (next == NEXT_AT_HOME) { finishAtHome(); return; }
     if (next == NEXT_AT_GOAL) {
       Serial.println(F("\n*** GOAL ROOM REACHED *** heading home"));
       blink5();
-      runState = ST_HOME;
+      runState = ST_SEARCH_HOME;
       continue;
     }
     if (next == NEXT_EXPLORED) {
@@ -1331,7 +1317,7 @@ void searchStep() {
         return;  // read the walls here again
       }
       Serial.println(F("No 2x2 room found. Heading home."));
-      runState = ST_HOME;
+      runState = ST_SEARCH_HOME;
       continue;
     }
     if (next == NEXT_NO_WAY) {
@@ -1339,7 +1325,7 @@ void searchStep() {
       continue;
     }
     if (SHOW_MAP_EACH_CELL && !shown) { printMaze(); shown = true; }
-    if (driveTo(planDir, planRun, DRIVE_PWM) || lastDriveResult != DRIVE_WALL) return;
+    if (driveTo(planDir, planRun, DRIVE_PWM) || !wallStop) return;
   }  // a wall it just found blocks the way: choose again
 }
 
@@ -1349,7 +1335,7 @@ void fastStep() {
   if (isGoal(posX, posY)) {
     Serial.println(F("\n*** GOAL *** heading home"));
     blink5();
-    runState = ST_HOME;
+    runState = ST_SEARCH_HOME;
     return;
   }
   if (goalX < 0) {
@@ -1432,7 +1418,7 @@ void loop() {
     int b = readButton();
     if (b == 1) {
       Serial.println(F("\n--- SEARCH ---"));
-      beginRun(ST_SEARCH);
+      beginRun(ST_SEARCH_GOAL);
     } else if (b == 2) {
       Serial.println(F("\n--- FAST RUN ---"));
       beginRun(ST_FAST);

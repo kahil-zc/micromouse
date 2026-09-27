@@ -170,7 +170,7 @@ static bool fail(const char *why, int seed) {
 
 // One search from the start cell until home. Mirrors searchStep() of the sketch.
 static bool search(const Truth &t, int seed, bool &found) {
-  runStateSim = ST_SEARCH;
+  runStateSim = ST_SEARCH_GOAL;
   posX = START_X; posY = START_Y; facing = 0;
   candX = candY = -1;
   int passes = 0;
@@ -180,16 +180,16 @@ static bool search(const Truth &t, int seed, bool &found) {
     if (checkGoal()) {
       if (goalX != t.roomX || goalY != t.roomY) return fail("wrong goal room", seed);
       found = true;
-      runStateSim = ST_HOME;
+      runStateSim = ST_SEARCH_HOME;
     }
     for (int inner = 0;; inner++) {
       if (inner > 50) return fail("keeps choosing without moving", seed);
       uint8_t next = nextStep(runStateSim);
       if (next == NEXT_AT_HOME) return true;
-      if (next == NEXT_AT_GOAL) { found = true; runStateSim = ST_HOME; continue; }
+      if (next == NEXT_AT_GOAL) { found = true; runStateSim = ST_SEARCH_HOME; continue; }
       if (next == NEXT_EXPLORED) {
         if (++passes < SEARCH_PASSES) { initMaze(); break; }
-        runStateSim = ST_HOME;
+        runStateSim = ST_SEARCH_HOME;
         continue;
       }
       if (next == NEXT_NO_WAY) continue;
