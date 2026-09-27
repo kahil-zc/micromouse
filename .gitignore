@@ -27,3 +27,6 @@ tests/micromouse_25_sim
 tests/maze_26_section.inc
 tests/maze_26_config.inc
 tests/micromouse_26_sim
+tests/maze_27_section.inc
+tests/maze_27_config.inc
+tests/micromouse_27_sim
