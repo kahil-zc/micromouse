@@ -32,3 +32,5 @@ tests/maze_27_config.inc
 tests/micromouse_27_sim
 tests/maze28.inc
 tests/sim28
+tests/maze29.inc
+tests/sim29
