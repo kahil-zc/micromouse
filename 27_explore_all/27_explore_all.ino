@@ -22,7 +22,6 @@
 // ║  sensor; failed measurements (bad status or 0 mm) are thrown     ║
 // ║  away, so a flaky reading can't make a phantom wall or opening.  ║
 // ║                                                                  ║
-// ║                                                                  ║
 // ║  Button (START), robot in the start cell, back to the wall:      ║
 // ║    short press = SEARCH if no route is saved yet, else SPEED RUN ║
 // ║    long press (1 s, LED on) = SEARCH again                       ║
