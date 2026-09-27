@@ -270,22 +270,88 @@ VL53L0X sensorLeft;
 VL53L0X sensorFront;
 VL53L0X sensorRight;
 
-// Structs are defined before any function because the Arduino IDE puts its generated
-// function prototypes above the first function.
+// These two structs carry their own functions (member functions), so no free function takes
+// them as a parameter: the Arduino IDE writes its own declarations of all free functions near
+// the top of the sketch, above the structs, and would then not know these types.
 
-// Tracks one side sensor switching between wall and gap (see edgeUpdate).
+// --- SIDE-WALL EDGE CORRECTION ---
+// Posts sit on every cell boundary. When a side reading changes between wall and gap, the side
+// sensor is at a known spot (a post edge), which fixes the distance driven so far.
+// Tracks one side sensor switching between wall and gap.
 struct SideEdge {
   bool known, wall, pending;
   float since, pendingAt;
   uint8_t pendingCount;
+
+  void reset() { known = false; pending = false; }
+
+  // corrMm: running correction added to the encoder distance. startAxleMm: axle position at the
+  // start of the drive, measured from the centre of the cell the drive started in.
+  void update(int tof, float done, float &corrMm, float startAxleMm, char side) {
+    bool w = tof < SIDE_FOLLOW_MM;
+    if (!known) { known = true; wall = w; since = done; pending = false; return; }
+    if (w == wall) { pending = false; return; }
+    if (!pending) { pending = true; pendingAt = done; pendingCount = 1; return; }
+    if (++pendingCount < 2) return;  // two readings in a row: not noise
+
+    bool longEnough = (pendingAt - since) >= EDGE_MIN_RUN_MM;
+    wall = w; since = pendingAt; pending = false;
+    if (!longEnough) return;
+
+    // Boundary posts are centred on 180k + 90. A wall starts at the near face of a post and
+    // ends at its far face; the beam width shifts both slightly.
+    float edgeRel = w ? -(POST_HALF_MM + EDGE_BEAM_MM) : (POST_HALF_MM + EDGE_BEAM_MM);
+    float sensorY = startAxleMm + corrMm + pendingAt + SIDE_TOF_AHEAD_MM;
+    float k = round((sensorY - CELL_MM / 2 - edgeRel) / CELL_MM);
+    float trueY = k * CELL_MM + CELL_MM / 2 + edgeRel;
+    float c = trueY - sensorY;
+    if (fabs(c) < EDGE_MAX_CORR_MM) {
+      corrMm += c;
+      Serial.print(side); Serial.print(F(" edge, distance corrected by ")); Serial.println(c);
+    }
+  }
 };
 
-// Straight-line fit of one side reading against distance driven (see fitUpdate).
+// --- GYRO CORRECTION FROM SIDE WALLS ---
+// While a side wall is present, the reading against distance driven is a straight line whose
+// slope is the robot's real angle to the corridor. Comparing that with the gyro's angle over
+// the same stretch shows how far the gyro has drifted (turn scale error, bias drift), and the
+// gyro is pulled back a little each time. Fits carry on across stops until the robot turns.
+// Straight-line fit of one side reading against distance driven.
 struct WallFit {
   uint8_t n;
   float x0, sx, sy, sxx, sxy, sPsi;
+
+  void reset() { n = 0; }
+
+  // x: distance driven straight (odoMm + this drive). sideSign: +1 = left wall, -1 = right wall.
+  void update(int tof, float x, int sideSign) {
+    if (tof >= SIDE_FOLLOW_MM) { n = 0; return; }  // no wall: start again
+    if (n == 0) { x0 = x; sx = sy = sxx = sxy = sPsi = 0; }
+    x -= x0;
+    n++;
+    sx += x; sy += tof; sxx += x * x; sxy += x * tof;
+    sPsi += absoluteHeading - targetHeading;
+    if (n < WALL_FIT_MIN_N || x < WALL_FIT_SPAN_MM) return;
+
+    float den = n * sxx - sx * sx;
+    if (den > 1) {
+      float slope = (n * sxy - sx * sy) / den;
+      // Turned toward the left wall = left reading shrinks and right reading grows.
+      float wallPsi = -sideSign * asin(constrain(slope, -0.3f, 0.3f)) * RAD_TO_DEG;
+      float gyroPsi = sPsi / n;
+      float err = gyroPsi - wallPsi;
+      if (fabs(err) < 8) {  // larger means a bad fit (post, open cell), not drift
+        float step = constrain(err * HEADING_TRIM_GAIN, -MAX_TRIM_STEP_DEG, MAX_TRIM_STEP_DEG);
+        absoluteHeading -= step;
+        Serial.print(F("Gyro corrected from wall by ")); Serial.println(-step);
+      }
+    }
+    n = 0;
+  }
 };
 WallFit fitL, fitR;
+void resetFits() { fitL.reset(); fitR.reset(); }
 
 // --- MAZE (no hardware calls) ---
 // Compiled on a PC by tests/micromouse_24_sim.sh and run on random mazes.
@@ -642,73 +708,16 @@ float headingCorrection(bool useWalls) {
 // --- SIDE-WALL EDGE CORRECTION ---
 // Posts sit on every cell boundary. When a side reading changes between wall and gap, the side
 // sensor is at a known spot (a post edge), which fixes the distance driven so far.
-void resetEdge(SideEdge &e) { e.known = false; e.pending = false; }
-
-// corrMm: running correction added to the encoder distance. startAxleMm: axle position at the
-// start of the drive, measured from the centre of the cell the drive started in.
-void edgeUpdate(SideEdge &e, int tof, float done, float &corrMm, float startAxleMm, char side) {
-  bool w = tof < SIDE_FOLLOW_MM;
-  if (!e.known) { e.known = true; e.wall = w; e.since = done; e.pending = false; return; }
-  if (w == e.wall) { e.pending = false; return; }
-  if (!e.pending) { e.pending = true; e.pendingAt = done; e.pendingCount = 1; return; }
-  if (++e.pendingCount < 2) return;  // two readings in a row: not noise
-
-  bool longEnough = (e.pendingAt - e.since) >= EDGE_MIN_RUN_MM;
-  e.wall = w; e.since = e.pendingAt; e.pending = false;
-  if (!longEnough) return;
-
-  // Boundary posts are centred on 180k + 90. A wall starts at the near face of a post and
-  // ends at its far face; the beam width shifts both slightly.
-  float edgeRel = w ? -(POST_HALF_MM + EDGE_BEAM_MM) : (POST_HALF_MM + EDGE_BEAM_MM);
-  float sensorY = startAxleMm + corrMm + e.pendingAt + SIDE_TOF_AHEAD_MM;
-  float k = round((sensorY - CELL_MM / 2 - edgeRel) / CELL_MM);
-  float trueY = k * CELL_MM + CELL_MM / 2 + edgeRel;
-  float c = trueY - sensorY;
-  if (fabs(c) < EDGE_MAX_CORR_MM) {
-    corrMm += c;
-    Serial.print(side); Serial.print(F(" edge, distance corrected by ")); Serial.println(c);
-  }
-}
-
 // --- GYRO CORRECTION FROM SIDE WALLS ---
 // While a side wall is present, the reading against distance driven is a straight line whose
 // slope is the robot's real angle to the corridor. Comparing that with the gyro's angle over
 // the same stretch shows how far the gyro has drifted (turn scale error, bias drift), and the
 // gyro is pulled back a little each time. Fits carry on across stops until the robot turns.
-void resetFit(WallFit &f) { f.n = 0; }
-void resetFits() { resetFit(fitL); resetFit(fitR); }
-
-// x: distance driven straight (odoMm + this drive). sideSign: +1 = left wall, -1 = right wall.
-void fitUpdate(WallFit &f, int tof, float x, int sideSign) {
-  if (tof >= SIDE_FOLLOW_MM) { f.n = 0; return; }  // no wall: start again
-  if (f.n == 0) { f.x0 = x; f.sx = f.sy = f.sxx = f.sxy = f.sPsi = 0; }
-  x -= f.x0;
-  f.n++;
-  f.sx += x; f.sy += tof; f.sxx += x * x; f.sxy += x * tof;
-  f.sPsi += absoluteHeading - targetHeading;
-  if (f.n < WALL_FIT_MIN_N || x < WALL_FIT_SPAN_MM) return;
-
-  float den = f.n * f.sxx - f.sx * f.sx;
-  if (den > 1) {
-    float slope = (f.n * f.sxy - f.sx * f.sy) / den;
-    // Turned toward the left wall = left reading shrinks and right reading grows.
-    float wallPsi = -sideSign * asin(constrain(slope, -0.3f, 0.3f)) * RAD_TO_DEG;
-    float gyroPsi = f.sPsi / f.n;
-    float err = gyroPsi - wallPsi;
-    if (fabs(err) < 8) {  // larger means a bad fit (post, open cell), not drift
-      float step = constrain(err * HEADING_TRIM_GAIN, -MAX_TRIM_STEP_DEG, MAX_TRIM_STEP_DEG);
-      absoluteHeading -= step;
-      Serial.print(F("Gyro corrected from wall by ")); Serial.println(-step);
-    }
-  }
-  f.n = 0;
-}
-
 // --- MOVEMENT BEHAVIOURS ---
 // Drives distMm (negative = reverse) holding targetHeading.
 //  center:      steer toward the corridor centre using the side walls
 //  stopAtWall:  also stop at the decision point of a front wall
-//  startAxleMm: if not NAN, correct the distance at side-wall edges (see edgeUpdate)
+//  startAxleMm: if not NAN, correct the distance at side-wall edges (see SideEdge)
 // Returns DRIVE_STALL, DRIVE_DONE or DRIVE_WALL.
 int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float startAxleMm) {
   bool reverse = distMm < 0;
@@ -719,7 +728,7 @@ int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float 
   int result = DRIVE_DONE;
   float corr = 0;
   SideEdge edgeL, edgeR;
-  resetEdge(edgeL); resetEdge(edgeR);
+  edgeL.reset(); edgeR.reset();
   uint8_t lastSeqL = seqL, lastSeqR = seqR;
   resetTicks();
   float lastDone = 0;
@@ -730,13 +739,13 @@ int driveStraight(float distMm, int maxPwm, bool center, bool stopAtWall, float 
     float done = travelledMm();
     if (seqL != lastSeqL) {
       lastSeqL = seqL;
-      if (useEdges) edgeUpdate(edgeL, tofL, done, corr, startAxleMm, 'L');
-      if (useFit) fitUpdate(fitL, tofL, odoMm + done, +1);
+      if (useEdges) edgeL.update(tofL, done, corr, startAxleMm, 'L');
+      if (useFit) fitL.update(tofL, odoMm + done, +1);
     }
     if (seqR != lastSeqR) {
       lastSeqR = seqR;
-      if (useEdges) edgeUpdate(edgeR, tofR, done, corr, startAxleMm, 'R');
-      if (useFit) fitUpdate(fitR, tofR, odoMm + done, -1);
+      if (useEdges) edgeR.update(tofR, done, corr, startAxleMm, 'R');
+      if (useFit) fitR.update(tofR, odoMm + done, -1);
     }
     if (!reverse && frontCrash()) {
       Serial.println(F("FRONT TOO CLOSE - emergency stop"));
