@@ -46,7 +46,7 @@
 // ║                                                                  ║
 // ║  Also from the ToFs: after every turn it checks it's centred in  ║
 // ║  the corridor (side ToFs) and shuffles back if it's more than    ║
-// ║  10 mm off; before a straight, if more than 12 mm off.            ║
+// ║  10 mm off; before a straight, if more than 12 mm off.           ║
 // ║                                                                  ║
 // ║  USB (Serial Monitor, 115200): the map is printed at the goal,   ║
 // ║  at home and at every pause; send 'm' while it waits to print it ║
@@ -1211,10 +1211,6 @@ void blink(uint8_t times) {
   for (uint8_t i = 0; i < times; i++) { digitalWrite(STATUS_LED, HIGH); delay(80); digitalWrite(STATUS_LED, LOW); delay(80); }
 }
 
-// Something went wrong (stuck, about to crash, a turn failed) or the button was pressed. Stop,
-// blink twice, LED on, and wait to be put back in the middle of the cell it last stopped in
-// (posX, posY), facing `facing`. Short press = carry on from there, long press = end the run.
-// Nothing from the failed move went into the map.
 // Prints why the robot last paused (kept in EEPROM, so it survives switching off).
 void printLastPause() {
   uint8_t why = EEPROM.read(EE_LOG);
@@ -1227,6 +1223,10 @@ void printLastPause() {
   Serial.print(F(". Pauses that run: ")); Serial.println(EEPROM.read(EE_LOG + 4));
 }
 
+// Something went wrong (stuck, about to crash, a turn failed) or the button was pressed. Stop,
+// blink `why` times slowly, LED on, and wait to be put back in the middle of the cell it last
+// stopped in (posX, posY), facing `facing`. Short press = carry on from there, long press = end
+// the run. Nothing from the failed move went into the map.
 void pauseForHelp(uint8_t why) {
   stopMotors();
   while (digitalRead(START_BUTTON) == LOW);
