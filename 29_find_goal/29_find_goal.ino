@@ -619,7 +619,7 @@ void senseFor(unsigned long ms) {
   while (millis() - start < ms) { sense(); delay(2); }
 }
 
-// Averages all three good readings over ~150 ms while standing still. 999 = nothing in range
+// Averages all three good readings over ms while standing still. 999 = nothing in range
 // (or no good reading at all).
 void averageOver(unsigned long ms, float &l, float &f, float &r) {
   accL = accF = accR = 0; cntL = cntF = cntR = 0;
