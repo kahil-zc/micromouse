@@ -27,6 +27,80 @@ static const float DOOR_WAIT = 4.0f;       // seconds a door stays open
 
 static Player& P = G.p;
 
+// ============================================================================ types and tables
+// Everything is declared before the first function, so these files can also be pasted together
+// into a single .ino (the Arduino IDE adds its own function prototypes above the first function).
+struct Bitmap {
+  uint8_t w, h;
+  uint32_t on[32];     // white pixels
+  uint32_t solid[32];  // white + black pixels, plus the outline ring
+};
+
+enum BmpId {
+  B_ZOMBIE_W1, B_ZOMBIE_W2, B_ZOMBIE_ATK, B_IMP_W1, B_IMP_W2, B_IMP_ATK,
+  B_DEMON_W1, B_DEMON_W2, B_DEMON_ATK, B_BARON_W1, B_BARON_W2, B_BARON_ATK,
+  B_DIE, B_CORPSE, B_BARREL, B_MEDKIT, B_CLIP, B_AMMOBOX, B_SHOTGUN_PICK, B_KEY,
+  B_FIREBALL1, B_FIREBALL2, B_PLASMA, B_PUFF, B_BLAST1, B_BLAST2,
+  B_PISTOL, B_SHOTGUN, B_FIST, B_FLASH,
+  B_ICON_HEALTH, B_ICON_AMMO, B_ICON_SKULL, B_ICON_KEY, B_FACE_OK, B_FACE_HURT, B_FACE_DEAD,
+  B_COUNT
+};
+
+static const int FIRST_ICON = B_ICON_HEALTH;   // icons get no outline
+
+static const ArtDef ART[B_COUNT] = {
+  { SPR_ZOMBIE_W1, 16 }, { SPR_ZOMBIE_W2, 16 }, { SPR_ZOMBIE_ATK, 16 },
+  { SPR_IMP_W1, 16 }, { SPR_IMP_W2, 16 }, { SPR_IMP_ATK, 16 },
+  { SPR_DEMON_W1, 16 }, { SPR_DEMON_W2, 16 }, { SPR_DEMON_ATK, 16 },
+  { SPR_BARON_W1, 16 }, { SPR_BARON_W2, 16 }, { SPR_BARON_ATK, 16 },
+  { SPR_DIE, 16 }, { SPR_CORPSE, 16 }, { SPR_BARREL, 10 }, { SPR_MEDKIT, 12 }, { SPR_CLIP, 8 },
+  { SPR_AMMOBOX, 12 }, { SPR_SHOTGUN_PICK, 16 }, { SPR_KEY, 10 },
+  { SPR_FIREBALL1, 8 }, { SPR_FIREBALL2, 8 }, { SPR_PLASMA, 8 }, { SPR_PUFF, 7 },
+  { SPR_BLAST1, 16 }, { SPR_BLAST2, 16 },
+  { WPN_PISTOL, 20 }, { WPN_SHOTGUN, 26 }, { WPN_FIST, 24 }, { WPN_FLASH, 14 },
+  { ICON_HEALTH, 7 }, { ICON_AMMO, 3 }, { ICON_SKULL, 7 }, { ICON_KEY, 9 },
+  { FACE_OK, 7 }, { FACE_HURT, 7 }, { FACE_DEAD, 7 },
+};
+
+static Bitmap bmp[B_COUNT];
+
+enum TexId { TX_BRICK, TX_TECH, TX_STONE, TX_DOOR, TX_LOCKED, TX_EXIT, TX_COUNT };
+static const char* const TEX_SRC[TX_COUNT] = { TEX_BRICK, TEX_TECH, TEX_STONE, TEX_DOOR, TEX_LOCKED, TEX_EXIT };
+static uint16_t tex[TX_COUNT][16];
+
+static uint8_t* FB;
+
+static const uint8_t BAYER[4][4] = { { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 } };
+
+enum Tile : uint8_t { T_EMPTY, T_BRICK, T_TECH, T_STONE, T_DOOR, T_LOCKED, T_EXIT };
+
+struct RayHit { float dist, wallX; uint8_t tex, side; int16_t cx, cy; };
+
+enum AttackKind : uint8_t { ATK_HITSCAN, ATK_FIREBALL, ATK_MELEE, ATK_PLASMA };
+
+struct MonInfo {
+  int16_t hp;
+  float speed, radius, height, range, windup, cdMin, cdMax;
+  uint8_t attack;
+  int16_t dmgMin, dmgMax;
+  float painChance;
+  uint8_t walk1, walk2, atk;
+};
+
+static const MonInfo MON[4] = {
+  // hp   speed  radius height range windup cdMin cdMax  attack        dmg     pain
+  {  20, 1.3f, 0.30f, 0.72f, 10.0f, 0.50f, 1.4f, 2.6f, ATK_HITSCAN,  4, 10, 0.80f, B_ZOMBIE_W1, B_ZOMBIE_W2, B_ZOMBIE_ATK },
+  {  50, 1.5f, 0.30f, 0.78f, 11.0f, 0.55f, 1.6f, 3.0f, ATK_FIREBALL, 8, 14, 0.65f, B_IMP_W1, B_IMP_W2, B_IMP_ATK },
+  {  90, 2.7f, 0.36f, 0.72f,  1.2f, 0.30f, 0.7f, 1.1f, ATK_MELEE,    8, 16, 0.50f, B_DEMON_W1, B_DEMON_W2, B_DEMON_ATK },
+  { 400, 1.3f, 0.40f, 1.05f, 13.0f, 0.65f, 1.2f, 2.2f, ATK_PLASMA,  16, 26, 0.12f, B_BARON_W1, B_BARON_W2, B_BARON_ATK },
+};
+
+struct SpriteRef { float depth, sx; uint8_t idx; };
+
+static float zbuf[SCREEN_W];
+
+static int flowCellX = -1, flowCellY = -1;
+
 // ============================================================================ small helpers
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static int imin(int a, int b) { return a < b ? a : b; }
@@ -50,43 +124,6 @@ static void message(const char* m) {
 }
 
 // ============================================================================ bitmaps
-struct Bitmap {
-  uint8_t w, h;
-  uint32_t on[32];     // white pixels
-  uint32_t solid[32];  // white + black pixels, plus the outline ring
-};
-
-enum BmpId {
-  B_ZOMBIE_W1, B_ZOMBIE_W2, B_ZOMBIE_ATK, B_IMP_W1, B_IMP_W2, B_IMP_ATK,
-  B_DEMON_W1, B_DEMON_W2, B_DEMON_ATK, B_BARON_W1, B_BARON_W2, B_BARON_ATK,
-  B_DIE, B_CORPSE, B_BARREL, B_MEDKIT, B_CLIP, B_AMMOBOX, B_SHOTGUN_PICK, B_KEY,
-  B_FIREBALL1, B_FIREBALL2, B_PLASMA, B_PUFF, B_BLAST1, B_BLAST2,
-  B_PISTOL, B_SHOTGUN, B_FIST, B_FLASH,
-  B_ICON_HEALTH, B_ICON_AMMO, B_ICON_SKULL, B_ICON_KEY, B_FACE_OK, B_FACE_HURT, B_FACE_DEAD,
-  B_COUNT
-};
-static const int FIRST_ICON = B_ICON_HEALTH;   // icons get no outline
-
-static const ArtDef ART[B_COUNT] = {
-  { SPR_ZOMBIE_W1, 16 }, { SPR_ZOMBIE_W2, 16 }, { SPR_ZOMBIE_ATK, 16 },
-  { SPR_IMP_W1, 16 }, { SPR_IMP_W2, 16 }, { SPR_IMP_ATK, 16 },
-  { SPR_DEMON_W1, 16 }, { SPR_DEMON_W2, 16 }, { SPR_DEMON_ATK, 16 },
-  { SPR_BARON_W1, 16 }, { SPR_BARON_W2, 16 }, { SPR_BARON_ATK, 16 },
-  { SPR_DIE, 16 }, { SPR_CORPSE, 16 }, { SPR_BARREL, 10 }, { SPR_MEDKIT, 12 }, { SPR_CLIP, 8 },
-  { SPR_AMMOBOX, 12 }, { SPR_SHOTGUN_PICK, 16 }, { SPR_KEY, 10 },
-  { SPR_FIREBALL1, 8 }, { SPR_FIREBALL2, 8 }, { SPR_PLASMA, 8 }, { SPR_PUFF, 7 },
-  { SPR_BLAST1, 16 }, { SPR_BLAST2, 16 },
-  { WPN_PISTOL, 20 }, { WPN_SHOTGUN, 26 }, { WPN_FIST, 24 }, { WPN_FLASH, 14 },
-  { ICON_HEALTH, 7 }, { ICON_AMMO, 3 }, { ICON_SKULL, 7 }, { ICON_KEY, 9 },
-  { FACE_OK, 7 }, { FACE_HURT, 7 }, { FACE_DEAD, 7 },
-};
-
-static Bitmap bmp[B_COUNT];
-
-enum TexId { TX_BRICK, TX_TECH, TX_STONE, TX_DOOR, TX_LOCKED, TX_EXIT, TX_COUNT };
-static const char* const TEX_SRC[TX_COUNT] = { TEX_BRICK, TEX_TECH, TEX_STONE, TEX_DOOR, TEX_LOCKED, TEX_EXIT };
-static uint16_t tex[TX_COUNT][16];
-
 static void buildBitmap(Bitmap& b, const ArtDef& a, bool outline) {
   memset(&b, 0, sizeof(b));
   b.w = a.w;
@@ -123,17 +160,15 @@ static void buildArt() {
 }
 
 // ============================================================================ frame buffer
-static uint8_t* FB;
 
-static inline void pset(int x, int y) { FB[x + (y >> 3) * SCREEN_W] |= (uint8_t)(1u << (y & 7)); }
-static inline void pclr(int x, int y) { FB[x + (y >> 3) * SCREEN_W] &= (uint8_t)~(1u << (y & 7)); }
-static inline void pput(int x, int y, bool on) { if (on) pset(x, y); else pclr(x, y); }
-static inline void pxor(int x, int y) { FB[x + (y >> 3) * SCREEN_W] ^= (uint8_t)(1u << (y & 7)); }
-static inline bool onScreen(int x, int y) { return x >= 0 && y >= 0 && x < SCREEN_W && y < SCREEN_H; }
+static void pset(int x, int y) { FB[x + (y >> 3) * SCREEN_W] |= (uint8_t)(1u << (y & 7)); }
+static void pclr(int x, int y) { FB[x + (y >> 3) * SCREEN_W] &= (uint8_t)~(1u << (y & 7)); }
+static void pput(int x, int y, bool on) { if (on) pset(x, y); else pclr(x, y); }
+static void pxor(int x, int y) { FB[x + (y >> 3) * SCREEN_W] ^= (uint8_t)(1u << (y & 7)); }
+static bool onScreen(int x, int y) { return x >= 0 && y >= 0 && x < SCREEN_W && y < SCREEN_H; }
 
-static const uint8_t BAYER[4][4] = { { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 } };
 // level 0 = black .. 1 = white, as an ordered-dither pattern that reads as grey on the OLED.
-static inline bool dither(int x, int y, float level) { return level * 16.0f > BAYER[y & 3][x & 3]; }
+static bool dither(int x, int y, float level) { return level * 16.0f > BAYER[y & 3][x & 3]; }
 
 static void fillRect(int x, int y, int w, int h, bool on) {
   for (int yy = imax(y, 0); yy < imin(y + h, SCREEN_H); yy++)
@@ -149,7 +184,7 @@ static void rect(int x, int y, int w, int h) {
 }
 
 // Unscaled blit. Sprites (with outline) draw black where solid and white where on.
-static void blit(const Bitmap& b, int x0, int y0, int clipBottom = SCREEN_H) {
+static void blit(const Bitmap& b, int x0, int y0, int clipBottom) {
   for (int y = 0; y < b.h; y++) {
     int sy = y0 + y;
     if (sy < 0 || sy >= clipBottom) continue;
@@ -179,29 +214,28 @@ static void drawChar(int x, int y, char c, int scale, bool white) {
 
 static int textWidth(const char* s, int scale) { int n = (int)strlen(s); return n ? n * 6 * scale - scale : 0; }
 
-static void drawText(int x, int y, const char* s, int scale = 1, bool white = true) {
+static void drawText(int x, int y, const char* s, int scale, bool white) {
   for (; *s; s++, x += 6 * scale) drawChar(x, y, *s, scale, white);
 }
 
-static void drawTextCentered(int y, const char* s, int scale = 1) {
-  drawText((SCREEN_W - textWidth(s, scale)) / 2, y, s, scale);
+static void drawTextCentered(int y, const char* s, int scale) {
+  drawText((SCREEN_W - textWidth(s, scale)) / 2, y, s, scale, true);
 }
 
-static void drawTextBox(int y, const char* s, int scale = 1) {
+static void drawTextBox(int y, const char* s, int scale) {
   int w = textWidth(s, scale);
   int x = (SCREEN_W - w) / 2;
   fillRect(x - 3, y - 2, w + 6, 7 * scale + 4, false);
-  drawText(x, y, s, scale);
+  drawText(x, y, s, scale, true);
 }
 
 // ============================================================================ map
-enum Tile : uint8_t { T_EMPTY, T_BRICK, T_TECH, T_STONE, T_DOOR, T_LOCKED, T_EXIT };
 
-static inline uint8_t tileAt(int x, int y) {
+static uint8_t tileAt(int x, int y) {
   if (x < 0 || y < 0 || x >= G.mapW || y >= G.mapH) return T_BRICK;
   return G.tiles[y][x];
 }
-static inline bool isDoorTile(uint8_t t) { return t == T_DOOR || t == T_LOCKED; }
+static bool isDoorTile(uint8_t t) { return t == T_DOOR || t == T_LOCKED; }
 
 static bool blocksMove(int x, int y) {
   uint8_t t = tileAt(x, y);
@@ -235,8 +269,6 @@ static bool lineClear(float x0, float y0, float x1, float y1) {
   }
   return true;
 }
-
-struct RayHit { float dist, wallX; uint8_t tex, side; int16_t cx, cy; };
 
 // DDA ray from (ox,oy) along (rdx,rdy). dist is in units of the ray vector, which for the
 // camera rays is the perpendicular distance (no fisheye) and for unit vectors is plain distance.
@@ -285,29 +317,11 @@ static void castRay(float ox, float oy, float rdx, float rdy, RayHit& h) {
 }
 
 // ============================================================================ entities
-enum AttackKind : uint8_t { ATK_HITSCAN, ATK_FIREBALL, ATK_MELEE, ATK_PLASMA };
 
-struct MonInfo {
-  int16_t hp;
-  float speed, radius, height, range, windup, cdMin, cdMax;
-  uint8_t attack;
-  int16_t dmgMin, dmgMax;
-  float painChance;
-  uint8_t walk1, walk2, atk;
-};
-
-static const MonInfo MON[4] = {
-  // hp   speed  radius height range windup cdMin cdMax  attack        dmg     pain
-  {  20, 1.3f, 0.30f, 0.72f, 10.0f, 0.50f, 1.4f, 2.6f, ATK_HITSCAN,  4, 10, 0.80f, B_ZOMBIE_W1, B_ZOMBIE_W2, B_ZOMBIE_ATK },
-  {  50, 1.5f, 0.30f, 0.78f, 11.0f, 0.55f, 1.6f, 3.0f, ATK_FIREBALL, 8, 14, 0.65f, B_IMP_W1, B_IMP_W2, B_IMP_ATK },
-  {  90, 2.7f, 0.36f, 0.72f,  1.2f, 0.30f, 0.7f, 1.1f, ATK_MELEE,    8, 16, 0.50f, B_DEMON_W1, B_DEMON_W2, B_DEMON_ATK },
-  { 400, 1.3f, 0.40f, 1.05f, 13.0f, 0.65f, 1.2f, 2.2f, ATK_PLASMA,  16, 26, 0.12f, B_BARON_W1, B_BARON_W2, B_BARON_ATK },
-};
-
-static inline bool isMonster(uint8_t t) { return t >= ENT_ZOMBIE && t <= ENT_BARON; }
-static inline bool isPickup(uint8_t t) { return t >= ENT_MEDKIT && t <= ENT_KEY; }
-static inline const MonInfo& monInfo(const Ent& e) { return MON[e.type - ENT_ZOMBIE]; }
-static inline bool monAlive(const Ent& e) { return isMonster(e.type) && e.state != MS_DYING && e.state != MS_DEAD; }
+static bool isMonster(uint8_t t) { return t >= ENT_ZOMBIE && t <= ENT_BARON; }
+static bool isPickup(uint8_t t) { return t >= ENT_MEDKIT && t <= ENT_KEY; }
+static const MonInfo& monInfo(const Ent& e) { return MON[e.type - ENT_ZOMBIE]; }
+static bool monAlive(const Ent& e) { return isMonster(e.type) && e.state != MS_DYING && e.state != MS_DEAD; }
 
 static float entRadius(const Ent& e) {
   if (isMonster(e.type)) return monInfo(e).radius;
@@ -413,7 +427,6 @@ static void updateDoors(float dt) {
 // Grid distance from the player. Monsters that can't see you walk down it to find their way:
 // closed doors count as open for them (they open them), red doors only once open. Gunfire is
 // heard only through doors that are open.
-static int flowCellX = -1, flowCellY = -1;
 
 static void distanceFromPlayer(int16_t (*dist)[MAX_MAP], bool hearing) {
   static uint16_t queue[MAX_MAP * MAX_MAP];
@@ -1004,7 +1017,6 @@ void gameUpdate(const GameInput& in, float dt) {
 }
 
 // ============================================================================ rendering
-static float zbuf[SCREEN_W];
 
 // Brightness of lit wall texels: full white up close, fading with distance. Walls facing
 // north/south are a little darker so corners show.
@@ -1101,8 +1113,6 @@ static void drawSprite(const Bitmap& b, float cx, float bottom, float hpx, float
   }
 }
 
-struct SpriteRef { float depth, sx; uint8_t idx; };
-
 static void renderSprites() {
   static SpriteRef list[MAX_ENTS];
   int n = 0;
@@ -1194,18 +1204,18 @@ static void renderHud() {
   hline(0, SCREEN_W - 1, VIEW_H);
   char buf[12];
   int y = VIEW_H + 1;
-  blit(bmp[B_ICON_HEALTH], 0, y);
+  blit(bmp[B_ICON_HEALTH], 0, y, SCREEN_H);
   bool lowBlink = G.state == ST_PLAY && P.hp <= 25 && ((int)(G.levelTime * 4) & 1);
-  if (!lowBlink) { snprintf(buf, sizeof(buf), "%3d", P.hp); drawText(9, y, buf); }
-  blit(bmp[B_ICON_AMMO], 32, y);
-  if (P.weapon == 0) drawText(37, y, " --");
-  else { snprintf(buf, sizeof(buf), "%3d", P.ammo); drawText(37, y, buf); }
-  blit(bmp[B_ICON_SKULL], 60, y);
+  if (!lowBlink) { snprintf(buf, sizeof(buf), "%3d", P.hp); drawText(9, y, buf, 1, true); }
+  blit(bmp[B_ICON_AMMO], 32, y, SCREEN_H);
+  if (P.weapon == 0) drawText(37, y, " --", 1, true);
+  else { snprintf(buf, sizeof(buf), "%3d", P.ammo); drawText(37, y, buf, 1, true); }
+  blit(bmp[B_ICON_SKULL], 60, y, SCREEN_H);
   snprintf(buf, sizeof(buf), "%d/%d", G.kills, G.totalMonsters);
-  drawText(69, y, buf);
-  if (P.hasKey) blit(bmp[B_ICON_KEY], 106, y);
+  drawText(69, y, buf, 1, true);
+  if (P.hasKey) blit(bmp[B_ICON_KEY], 106, y, SCREEN_H);
   int face = G.state == ST_DEAD ? B_FACE_DEAD : (P.hp < 40 || P.hurtFlash > 0) ? B_FACE_HURT : B_FACE_OK;
-  blit(bmp[face], SCREEN_W - 7, y);
+  blit(bmp[face], SCREEN_W - 7, y, SCREEN_H);
 }
 
 static void renderFlashes() {
@@ -1252,8 +1262,8 @@ static void renderAutomap() {
     if (onScreen(x, y)) pset(x, y);
   }
   fillRect((int)pxf - 1, (int)pyf - 1, 3, 3, true);
-  drawText(0, 0, LEVELS[G.level].id);
-  if (G.state == ST_PLAY) drawText(SCREEN_W - textWidth("FIRE:QUIT", 1), 0, "FIRE:QUIT");
+  drawText(0, 0, LEVELS[G.level].id, 1, true);
+  if (G.state == ST_PLAY) drawText(SCREEN_W - textWidth("FIRE:QUIT", 1), 0, "FIRE:QUIT", 1, true);
 }
 
 static void formatTime(char* buf, int n, float t) {
@@ -1272,21 +1282,21 @@ void gameRender(uint8_t* fb) {
   if (G.state == ST_LEVEL_DONE || G.state == ST_VICTORY) {
     if (G.state == ST_LEVEL_DONE) {
       snprintf(buf, sizeof(buf), "%s FINISHED", LEVELS[G.level].id);
-      drawTextCentered(1, buf);
-      drawTextCentered(11, LEVELS[G.level].name);
+      drawTextCentered(1, buf, 1);
+      drawTextCentered(11, LEVELS[G.level].name, 1);
       hline(10, SCREEN_W - 11, 20);
-      snprintf(buf, sizeof(buf), "KILLS  %3d%%", percent(G.kills, G.totalMonsters)); drawText(25, 24, buf);
-      snprintf(buf, sizeof(buf), "ITEMS  %3d%%", percent(G.items, G.totalItems)); drawText(25, 33, buf);
+      snprintf(buf, sizeof(buf), "KILLS  %3d%%", percent(G.kills, G.totalMonsters)); drawText(25, 24, buf, 1, true);
+      snprintf(buf, sizeof(buf), "ITEMS  %3d%%", percent(G.items, G.totalItems)); drawText(25, 33, buf, 1, true);
       char t[12]; formatTime(t, sizeof(t), G.levelTime);
-      snprintf(buf, sizeof(buf), "TIME  %5s", t); drawText(25, 42, buf);
+      snprintf(buf, sizeof(buf), "TIME  %5s", t); drawText(25, 42, buf, 1, true);
     } else {
       drawTextCentered(2, "YOU WIN!", 2);
-      drawTextCentered(20, "HELL IS SILENT.");
-      snprintf(buf, sizeof(buf), "KILLS %d/%d", G.totalKills, G.totalMonstersAll); drawTextCentered(31, buf);
+      drawTextCentered(20, "HELL IS SILENT.", 1);
+      snprintf(buf, sizeof(buf), "KILLS %d/%d", G.totalKills, G.totalMonstersAll); drawTextCentered(31, buf, 1);
       char t[12]; formatTime(t, sizeof(t), G.totalTime);
-      snprintf(buf, sizeof(buf), "TIME %s", t); drawTextCentered(40, buf);
+      snprintf(buf, sizeof(buf), "TIME %s", t); drawTextCentered(40, buf, 1);
     }
-    if (G.stateTimer > 0.6f && blink) drawTextCentered(55, "PRESS FIRE");
+    if (G.stateTimer > 0.6f && blink) drawTextCentered(55, "PRESS FIRE", 1);
     return;
   }
 
@@ -1303,11 +1313,11 @@ void gameRender(uint8_t* fb) {
     int w = textWidth("DOOM", 3);
     fillRect((SCREEN_W - w) / 2 - 4, 2, w + 8, 27, false);
     rect((SCREEN_W - w) / 2 - 4, 2, w + 8, 27);
-    drawText((SCREEN_W - w) / 2, 5, "DOOM", 3);
+    drawText((SCREEN_W - w) / 2, 5, "DOOM", 3, true);
     snprintf(buf, sizeof(buf), "< %s >", LEVELS[G.selectLevel].id);
-    drawTextBox(35, buf);
-    drawTextBox(46, LEVELS[G.selectLevel].name);
-    if (blink) drawTextBox(56, "PRESS FIRE");
+    drawTextBox(35, buf, 1);
+    drawTextBox(46, LEVELS[G.selectLevel].name, 1);
+    if (blink) drawTextBox(56, "PRESS FIRE", 1);
     return;
   }
 
@@ -1322,14 +1332,14 @@ void gameRender(uint8_t* fb) {
     fillRect((SCREEN_W - w) / 2 - 4, 10, w + 8, 29, false);
     rect((SCREEN_W - w) / 2 - 4, 10, w + 8, 29);
     drawTextCentered(13, buf, 2);
-    drawTextCentered(29, LEVELS[G.level].name);
+    drawTextCentered(29, LEVELS[G.level].name, 1);
   } else if (G.msgTimer > 0) {
     fillRect(0, 0, textWidth(G.msg, 1) + 3, 9, false);
-    drawText(1, 1, G.msg);
+    drawText(1, 1, G.msg, 1, true);
   }
 
   if (G.state == ST_DEAD && G.stateTimer > 0.8f) {
     drawTextBox(12, "YOU DIED", 2);
-    if (blink) drawTextBox(38, "FIRE: RESTART");
+    if (blink) drawTextBox(38, "FIRE: RESTART", 1);
   }
 }
